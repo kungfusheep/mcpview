@@ -47,10 +47,20 @@ node server.js
 - Q to quit
 
 ### Tool Details
-- View tool name, description, and input schema
-- T to test the tool with empty arguments
+- View tool name, description, and dynamically generated parameter form
+- ↑/↓ or K/J to navigate between parameters
+- Enter or E to edit a parameter value
+- T to test the tool with current parameter values
 - Esc to go back
 - Q to quit
+
+### Parameter Editing
+- Type to enter value for the selected parameter
+- Enter to save the value
+- Esc to cancel editing
+- Supports different field types: string, number, boolean, array, object
+- Shows field descriptions and enum options where available
+- Required fields are marked with *
 
 ### Resources List
 - ↑/↓ or K/J to navigate resources
