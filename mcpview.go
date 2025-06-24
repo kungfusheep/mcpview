@@ -524,8 +524,49 @@ func max(a, b int) int {
 	return b
 }
 
+// wrapText wraps text to fit within the specified width
+func wrapText(text string, width int) []string {
+	if width <= 0 {
+		return []string{text}
+	}
+	
+	var lines []string
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{""}
+	}
+	
+	currentLine := words[0]
+	for _, word := range words[1:] {
+		if len(currentLine)+1+len(word) <= width {
+			currentLine += " " + word
+		} else {
+			lines = append(lines, currentLine)
+			currentLine = word
+		}
+	}
+	if currentLine != "" {
+		lines = append(lines, currentLine)
+	}
+	
+	return lines
+}
+
 // Calculate tool layout based on total height
-func (m *Model) calculateToolLayout() {
+func (m *Model) calculateToolLayout(tool Tool) {
+	// Calculate dynamic info height based on tool description
+	descLines := wrapText(tool.Description, m.width-4) // Leave margin for borders
+	m.toolLayout.infoHeight = len(descLines) + 4 // Title + description + separators
+	
+	// Ensure minimum info height
+	if m.toolLayout.infoHeight < 4 {
+		m.toolLayout.infoHeight = 4
+	}
+	// Cap maximum info height to not overwhelm the screen
+	if m.toolLayout.infoHeight > m.toolLayout.totalHeight/3 {
+		m.toolLayout.infoHeight = m.toolLayout.totalHeight / 3
+	}
+	
 	availableHeight := m.toolLayout.totalHeight - m.toolLayout.infoHeight - 4 // Reserve space for instructions
 	if availableHeight < 6 {
 		availableHeight = 6
@@ -686,7 +727,7 @@ type DebugLayout struct {
 
 // Tool detail layout with three panes
 type ToolLayout struct {
-	infoHeight     int     // Top pane: tool info (fixed)
+	infoHeight     int     // Top pane: tool info (dynamic based on content)
 	paramHeight    int     // Middle pane: parameters
 	responseHeight int     // Bottom pane: responses
 	paramScroll    int     // Scroll position for parameters
@@ -781,7 +822,6 @@ func NewModel() Model {
 			splitRatio: 0.4, // 40% for message pane
 		},
 		toolLayout: ToolLayout{
-			infoHeight:  4,   // Fixed height for tool info
 			paramRatio:  0.4, // 40% for parameters, 60% for responses
 			totalHeight: 25,  // Default height
 		},
@@ -814,9 +854,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.debugLayout.mainPaneHeight = m.height - m.debugLayout.messagePaneHeight
 		}
 		// Recalculate tool layout if in tool detail mode
-		if m.state == StateToolDetail {
+		if m.state == StateToolDetail && len(m.tools) > 0 {
 			m.toolLayout.totalHeight = m.height
-			m.calculateToolLayout()
+			m.calculateToolLayout(m.tools[m.selectedTool])
 		}
 		return m, nil
 
@@ -928,12 +968,12 @@ func (m Model) updateToolsList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.toolLayout.totalHeight = m.height
 			m.toolLayout.paramScroll = 0
 			m.toolLayout.responseScroll = 0
-			m.calculateToolLayout()
+			tool := m.tools[m.selectedTool]
+			m.calculateToolLayout(tool)
 			// Reset tool state
 			m.toolState = ToolStateIdle
 			m.currentResponse = nil
 			// Generate form from tool schema
-			tool := m.tools[m.selectedTool]
 			if schema, err := parseJSONSchema(tool.InputSchema); err == nil {
 				m.formState = FormState{
 					Fields:       generateFormFromSchema(schema),
@@ -995,13 +1035,17 @@ func (m Model) updateToolDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Increase parameter pane size
 			if m.toolLayout.paramRatio < 0.8 {
 				m.toolLayout.paramRatio += 0.1
-				m.calculateToolLayout()
+				if len(m.tools) > 0 {
+					m.calculateToolLayout(m.tools[m.selectedTool])
+				}
 			}
 		case "-":
 			// Decrease parameter pane size (increase response pane)
 			if m.toolLayout.paramRatio > 0.2 {
 				m.toolLayout.paramRatio -= 0.1
-				m.calculateToolLayout()
+				if len(m.tools) > 0 {
+					m.calculateToolLayout(m.tools[m.selectedTool])
+				}
 			}
 		case "ctrl+up":
 			// Scroll parameters up
@@ -1365,13 +1409,26 @@ func (m Model) View() string {
 			return "No tool selected"
 		}
 
-		// Calculate layout for three panes
-		m.calculateToolLayout()
 		tool := m.tools[m.selectedTool]
+		// Calculate layout for three panes
+		m.calculateToolLayout(tool)
 		
-		// === TOP PANE: Tool Info (Fixed Height) ===
+		// === TOP PANE: Tool Info (Dynamic Height) ===
 		s := styles.title.Render("Tool: " + tool.Name)
-		s += "\n" + styles.normal.Render(tool.Description)
+		
+		// Wrap and display description
+		descLines := wrapText(tool.Description, m.width-4)
+		for _, line := range descLines {
+			s += "\n" + styles.normal.Render(line)
+		}
+		
+		// Add padding to reach calculated info height
+		currentLines := strings.Count(s, "\n") + 1
+		for currentLines < m.toolLayout.infoHeight-1 {
+			s += "\n"
+			currentLines++
+		}
+		
 		s += "\n" + strings.Repeat("─", m.width) // Separator
 		
 		// === MIDDLE PANE: Parameters (Scrollable) ===
