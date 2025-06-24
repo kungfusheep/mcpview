@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -516,12 +517,195 @@ func min(a, b int) int {
 	return b
 }
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// Calculate tool layout based on total height
+func (m *Model) calculateToolLayout() {
+	availableHeight := m.toolLayout.totalHeight - m.toolLayout.infoHeight - 4 // Reserve space for instructions
+	if availableHeight < 6 {
+		availableHeight = 6
+	}
+	
+	m.toolLayout.paramHeight = int(float64(availableHeight) * m.toolLayout.paramRatio)
+	m.toolLayout.responseHeight = availableHeight - m.toolLayout.paramHeight
+	
+	// Ensure minimum heights
+	if m.toolLayout.paramHeight < 3 {
+		m.toolLayout.paramHeight = 3
+		m.toolLayout.responseHeight = availableHeight - 3
+	}
+	if m.toolLayout.responseHeight < 3 {
+		m.toolLayout.responseHeight = 3
+		m.toolLayout.paramHeight = availableHeight - 3
+	}
+}
+
+// NewStdioProxy creates a new stdio proxy
+func NewStdioProxy(targetCmd string) *StdioProxy {
+	return &StdioProxy{
+		targetCmd:  targetCmd,
+		messageLog: make([]LoggedMessage, 0),
+	}
+}
+
+func (sp *StdioProxy) SetLogCallback(callback func(LoggedMessage)) {
+	sp.logCallback = callback
+}
+
+func (sp *StdioProxy) logMessage(direction MessageDirection, content []byte) {
+	msg := LoggedMessage{
+		Timestamp: time.Now(),
+		Direction: direction,
+		Content:   json.RawMessage(content),
+	}
+	
+	// Pretty print the JSON
+	var prettyBuf bytes.Buffer
+	if err := json.Indent(&prettyBuf, content, "", "  "); err == nil {
+		msg.Pretty = prettyBuf.String()
+	} else {
+		msg.Pretty = string(content)
+	}
+	
+	sp.mutex.Lock()
+	sp.messageLog = append(sp.messageLog, msg)
+	sp.mutex.Unlock()
+	
+	// Call callback if set
+	if sp.logCallback != nil {
+		sp.logCallback(msg)
+	}
+}
+
+// Start begins the stdio proxy operation
+func (sp *StdioProxy) Start() error {
+	// Start the target MCP server process
+	parts := strings.Fields(sp.targetCmd)
+	if len(parts) == 0 {
+		return fmt.Errorf("invalid target command: %s", sp.targetCmd)
+	}
+	
+	sp.targetProc = exec.Command(parts[0], parts[1:]...)
+	
+	stdin, err := sp.targetProc.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdin pipe: %v", err)
+	}
+	sp.targetStdin = stdin
+	
+	stdout, err := sp.targetProc.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %v", err)
+	}
+	sp.targetStdout = stdout
+	sp.targetReader = bufio.NewScanner(stdout)
+	
+	if err := sp.targetProc.Start(); err != nil {
+		return fmt.Errorf("failed to start target process: %v", err)
+	}
+	
+	sp.running = true
+	
+	// Start background goroutine to read from target server
+	go sp.readFromTarget()
+	
+	return nil
+}
+
+// RunProxy runs the stdio proxy, reading from stdin and writing to stdout
+func (sp *StdioProxy) RunProxy() error {
+	if err := sp.Start(); err != nil {
+		return err
+	}
+	
+	// Read from our stdin (client messages) and forward to target
+	stdinScanner := bufio.NewScanner(os.Stdin)
+	for stdinScanner.Scan() {
+		line := stdinScanner.Bytes()
+		
+		// Log client to server message
+		sp.logMessage(DirectionOutbound, line)
+		
+		// Forward to target server
+		if _, err := sp.targetStdin.Write(append(line, '\n')); err != nil {
+			return fmt.Errorf("error writing to target server: %v", err)
+		}
+	}
+	
+	return sp.Stop()
+}
+
+// readFromTarget reads responses from target server and forwards to our stdout
+func (sp *StdioProxy) readFromTarget() {
+	for sp.targetReader.Scan() {
+		line := sp.targetReader.Bytes()
+		
+		// Log server to client message
+		sp.logMessage(DirectionInbound, line)
+		
+		// Forward to our stdout (client)
+		if _, err := os.Stdout.Write(append(line, '\n')); err != nil {
+			log.Printf("Error writing to stdout: %v", err)
+			break
+		}
+	}
+}
+
+func (sp *StdioProxy) Stop() error {
+	sp.running = false
+	if sp.targetStdin != nil {
+		sp.targetStdin.Close()
+	}
+	if sp.targetStdout != nil {
+		sp.targetStdout.Close()
+	}
+	if sp.targetProc != nil {
+		return sp.targetProc.Wait()
+	}
+	return nil
+}
+
+func (sp *StdioProxy) GetMessageLog() []LoggedMessage {
+	sp.mutex.RLock()
+	defer sp.mutex.RUnlock()
+	return sp.messageLog
+}
+
 // Debug mode layout
 type DebugLayout struct {
 	messagePaneHeight int
 	messageScroll     int
 	mainPaneHeight    int
 	splitRatio        float64 // 0.0 to 1.0, portion for message pane
+}
+
+// Tool detail layout with three panes
+type ToolLayout struct {
+	infoHeight     int     // Top pane: tool info (fixed)
+	paramHeight    int     // Middle pane: parameters
+	responseHeight int     // Bottom pane: responses
+	paramScroll    int     // Scroll position for parameters
+	responseScroll int     // Scroll position for responses
+	paramRatio     float64 // 0.2 to 0.8, portion for parameters vs responses
+	totalHeight    int     // Total available height
+}
+
+// Stdio Proxy manages MCP stdio proxy functionality
+type StdioProxy struct {
+	targetCmd    string
+	targetProc   *exec.Cmd
+	targetStdin  io.WriteCloser
+	targetStdout io.ReadCloser
+	targetReader *bufio.Scanner
+	messageLog   []LoggedMessage
+	logCallback  func(LoggedMessage)
+	mutex        sync.RWMutex
+	running      bool
 }
 
 // Bubbletea Model
@@ -543,14 +727,44 @@ type Model struct {
 	formState        FormState
 	messageHistory   []LoggedMessage
 	debugLayout      DebugLayout
+	toolLayout       ToolLayout
 	liveMessages     []LoggedMessage // For real-time updates
+	toolState         ToolExecutionState
+	toolResponses     []ToolResponse
+	currentResponse   *ToolResponse
+	selectedResponse  int // For navigating through response history
 }
 
+// Tool execution state
+type ToolExecutionState int
+
+const (
+	ToolStateIdle ToolExecutionState = iota
+	ToolStateLoading
+	ToolStateSuccess
+	ToolStateError
+)
+
+// Tool response structure
+type ToolResponse struct {
+	ToolName     string                 `json:"toolName"`
+	Timestamp    time.Time             `json:"timestamp"`
+	Arguments    map[string]interface{} `json:"arguments"`
+	Success      bool                  `json:"success"`
+	Result       interface{}           `json:"result,omitempty"`
+	Error        string                `json:"error,omitempty"`
+	ExecutionTime time.Duration         `json:"executionTime"`
+	PrettyResult string                `json:"-"` // Pretty-printed version
+}
+
+// Message types
 type ConnectedMsg struct{}
 type ToolsLoadedMsg struct{ tools []Tool }
 type ResourcesLoadedMsg struct{ resources []Resource }
 type ErrorMsg struct{ err error }
 type MessageLoggedMsg struct{ message LoggedMessage }
+type ToolResponseMsg struct{ response ToolResponse }
+type ToolExecutionStartMsg struct{}
 
 func NewModel() Model {
 	client := NewMCPClient()
@@ -561,8 +775,15 @@ func NewModel() Model {
 		cursor:         0,
 		messageHistory: make([]LoggedMessage, 0),
 		liveMessages:   make([]LoggedMessage, 0),
+		toolState:      ToolStateIdle,
+		toolResponses:  make([]ToolResponse, 0),
 		debugLayout: DebugLayout{
 			splitRatio: 0.4, // 40% for message pane
+		},
+		toolLayout: ToolLayout{
+			infoHeight:  4,   // Fixed height for tool info
+			paramRatio:  0.4, // 40% for parameters, 60% for responses
+			totalHeight: 25,  // Default height
 		},
 	}
 	
@@ -591,6 +812,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == StateDebugMode {
 			m.debugLayout.messagePaneHeight = int(float64(m.height) * m.debugLayout.splitRatio)
 			m.debugLayout.mainPaneHeight = m.height - m.debugLayout.messagePaneHeight
+		}
+		// Recalculate tool layout if in tool detail mode
+		if m.state == StateToolDetail {
+			m.toolLayout.totalHeight = m.height
+			m.calculateToolLayout()
 		}
 		return m, nil
 
@@ -630,9 +856,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.liveMessages = m.client.GetMessageLog() // Update live messages too
 		return m, nil
 
+	case ToolExecutionStartMsg:
+		m.toolState = ToolStateLoading
+		m.error = "" // Clear any previous errors
+		return m, nil
+
+	case ToolResponseMsg:
+		if msg.response.Success {
+			m.toolState = ToolStateSuccess
+		} else {
+			m.toolState = ToolStateError
+		}
+		m.currentResponse = &msg.response
+		// Add to response history (keep last 10)
+		m.toolResponses = append(m.toolResponses, msg.response)
+		if len(m.toolResponses) > 10 {
+			m.toolResponses = m.toolResponses[1:]
+			m.selectedResponse = max(0, m.selectedResponse-1) // Adjust selection
+		} else {
+			m.selectedResponse = len(m.toolResponses) - 1 // Point to newest response
+		}
+		m.error = "" // Clear any previous errors
+		return m, nil
+
 	case ErrorMsg:
 		m.error = msg.err.Error()
 		m.loading = false
+		m.toolState = ToolStateError
 		return m, nil
 	}
 
@@ -674,6 +924,14 @@ func (m Model) updateToolsList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if len(m.tools) > 0 {
 			m.state = StateToolDetail
+			// Initialize tool layout
+			m.toolLayout.totalHeight = m.height
+			m.toolLayout.paramScroll = 0
+			m.toolLayout.responseScroll = 0
+			m.calculateToolLayout()
+			// Reset tool state
+			m.toolState = ToolStateIdle
+			m.currentResponse = nil
 			// Generate form from tool schema
 			tool := m.tools[m.selectedTool]
 			if schema, err := parseJSONSchema(tool.InputSchema); err == nil {
@@ -733,6 +991,64 @@ func (m Model) updateToolDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "t":
 			// Test tool with form arguments
 			return m, m.testToolWithForm()
+		case "+":
+			// Increase parameter pane size
+			if m.toolLayout.paramRatio < 0.8 {
+				m.toolLayout.paramRatio += 0.1
+				m.calculateToolLayout()
+			}
+		case "-":
+			// Decrease parameter pane size (increase response pane)
+			if m.toolLayout.paramRatio > 0.2 {
+				m.toolLayout.paramRatio -= 0.1
+				m.calculateToolLayout()
+			}
+		case "ctrl+up":
+			// Scroll parameters up
+			if m.toolLayout.paramScroll > 0 {
+				m.toolLayout.paramScroll--
+			}
+		case "ctrl+down":
+			// Scroll parameters down
+			maxParamScroll := max(0, len(m.formState.Fields)-m.toolLayout.paramHeight+2)
+			if m.toolLayout.paramScroll < maxParamScroll {
+				m.toolLayout.paramScroll++
+			}
+		case "shift+up":
+			// Scroll responses up
+			if m.toolLayout.responseScroll > 0 {
+				m.toolLayout.responseScroll--
+			}
+		case "shift+down":
+			// Scroll responses down
+			responseLines := 1 // Will calculate based on current response content
+			if m.currentResponse != nil && m.currentResponse.PrettyResult != "" {
+				responseLines = len(strings.Split(m.currentResponse.PrettyResult, "\n")) + 2
+			}
+			maxResponseScroll := max(0, responseLines-m.toolLayout.responseHeight+1)
+			if m.toolLayout.responseScroll < maxResponseScroll {
+				m.toolLayout.responseScroll++
+			}
+		case "left", "h":
+			// Navigate to previous response in history
+			if len(m.toolResponses) > 0 && m.selectedResponse > 0 {
+				m.selectedResponse--
+				m.currentResponse = &m.toolResponses[m.selectedResponse]
+				m.toolLayout.responseScroll = 0 // Reset scroll
+			}
+		case "right", "l":
+			// Navigate to next response in history
+			if len(m.toolResponses) > 0 && m.selectedResponse < len(m.toolResponses)-1 {
+				m.selectedResponse++
+				m.currentResponse = &m.toolResponses[m.selectedResponse]
+				m.toolLayout.responseScroll = 0 // Reset scroll
+			}
+		case "ctrl+r":
+			// Clear response history
+			m.toolResponses = make([]ToolResponse, 0)
+			m.currentResponse = nil
+			m.selectedResponse = 0
+			m.toolState = ToolStateIdle
 		}
 	case FormModeEdit:
 		switch msg.String() {
@@ -906,35 +1222,69 @@ func (m Model) testTool() tea.Cmd {
 }
 
 func (m Model) testToolWithForm() tea.Cmd {
-	return func() tea.Msg {
-		if len(m.tools) == 0 {
-			return ErrorMsg{fmt.Errorf("no tools available")}
-		}
-
-		tool := m.tools[m.selectedTool]
-		args := buildArgumentsFromForm(m.formState.Fields)
-		
-		resp, err := m.client.CallTool(tool.Name, args)
-		if err != nil {
-			return ErrorMsg{err}
-		}
-
-		// Display the response
-		var buf bytes.Buffer
-		if resp.Result != nil {
-			resultBytes, _ := json.MarshalIndent(resp.Result, "", "  ")
-			buf.WriteString("Tool Response:\n")
-			buf.Write(resultBytes)
-		} else if resp.Error != nil {
-			buf.WriteString(fmt.Sprintf("Tool Error: %s\n", resp.Error.Message))
-			if resp.Error.Data != nil {
-				dataBytes, _ := json.MarshalIndent(resp.Error.Data, "", "  ")
-				buf.Write(dataBytes)
+	return tea.Sequence(
+		func() tea.Msg {
+			return ToolExecutionStartMsg{}
+		},
+		func() tea.Msg {
+			if len(m.tools) == 0 {
+				return ErrorMsg{fmt.Errorf("no tools available")}
 			}
-		}
-		
-		return ErrorMsg{fmt.Errorf(buf.String())}
-	}
+
+			tool := m.tools[m.selectedTool]
+			args := buildArgumentsFromForm(m.formState.Fields)
+			
+			startTime := time.Now()
+			resp, err := m.client.CallTool(tool.Name, args)
+			executionTime := time.Since(startTime)
+			
+			if err != nil {
+				return ErrorMsg{err}
+			}
+
+			// Create tool response
+			toolResp := ToolResponse{
+				ToolName:      tool.Name,
+				Timestamp:     time.Now(),
+				Arguments:     args,
+				ExecutionTime: executionTime,
+			}
+
+			if resp.Result != nil {
+				// Success response
+				toolResp.Success = true
+				toolResp.Result = resp.Result
+				
+				// Pretty print the result
+				if resultBytes, err := json.MarshalIndent(resp.Result, "", "  "); err == nil {
+					toolResp.PrettyResult = string(resultBytes)
+				} else {
+					toolResp.PrettyResult = fmt.Sprintf("%+v", resp.Result)
+				}
+			} else if resp.Error != nil {
+				// Error response
+				toolResp.Success = false
+				toolResp.Error = resp.Error.Message
+				
+				if resp.Error.Data != nil {
+					if dataBytes, err := json.MarshalIndent(resp.Error.Data, "", "  "); err == nil {
+						toolResp.PrettyResult = fmt.Sprintf("Error: %s\nData:\n%s", resp.Error.Message, string(dataBytes))
+					} else {
+						toolResp.PrettyResult = fmt.Sprintf("Error: %s\nData: %+v", resp.Error.Message, resp.Error.Data)
+					}
+				} else {
+					toolResp.PrettyResult = fmt.Sprintf("Error: %s", resp.Error.Message)
+				}
+			} else {
+				// Empty response
+				toolResp.Success = true
+				toolResp.Result = nil
+				toolResp.PrettyResult = "(No response data)"
+			}
+			
+			return ToolResponseMsg{response: toolResp}
+		},
+	)
 }
 
 func (m Model) View() string {
@@ -1015,16 +1365,27 @@ func (m Model) View() string {
 			return "No tool selected"
 		}
 
+		// Calculate layout for three panes
+		m.calculateToolLayout()
 		tool := m.tools[m.selectedTool]
+		
+		// === TOP PANE: Tool Info (Fixed Height) ===
 		s := styles.title.Render("Tool: " + tool.Name)
 		s += "\n" + styles.normal.Render(tool.Description)
+		s += "\n" + strings.Repeat("─", m.width) // Separator
+		
+		// === MIDDLE PANE: Parameters (Scrollable) ===
+		s += "\n" + styles.header.Render("Parameters:")
 		
 		if len(m.formState.Fields) == 0 {
-			s += "\n\n" + styles.normal.Render("No parameters required")
+			s += "\n" + styles.normal.Render("No parameters required")
 		} else {
-			s += "\n\n" + styles.header.Render("Parameters:")
+			// Calculate visible parameter range
+			startIdx := m.toolLayout.paramScroll
+			endIdx := min(startIdx+m.toolLayout.paramHeight-1, len(m.formState.Fields))
 			
-			for i, field := range m.formState.Fields {
+			for i := startIdx; i < endIdx; i++ {
+				field := m.formState.Fields[i]
 				fieldStyle := styles.normal
 				if i == m.formState.CurrentField {
 					if m.formState.Mode == FormModeEdit {
@@ -1064,26 +1425,144 @@ func (m Model) View() string {
 				fieldLine := fmt.Sprintf("  %s (%s): %s", label, typeStr, value)
 				s += "\n" + fieldStyle.Render(fieldLine)
 				
-				// Show description if available
-				if field.Description != "" {
+				// Show description if available (only for selected field to save space)
+				if field.Description != "" && i == m.formState.CurrentField {
 					s += "\n" + styles.normal.Copy().Faint(true).Render("    " + field.Description)
 				}
 				
-				// Show options for enum fields
-				if len(field.Options) > 0 {
+				// Show options for enum fields (only for selected field)
+				if len(field.Options) > 0 && i == m.formState.CurrentField {
 					s += "\n" + styles.normal.Copy().Faint(true).Render("    Options: " + strings.Join(field.Options, ", "))
 				}
 			}
+			
+			// Show scroll indicators
+			if startIdx > 0 {
+				s += "\n" + styles.normal.Copy().Faint(true).Render("↑ More parameters above (Ctrl+Up to scroll)")
+			}
+			if endIdx < len(m.formState.Fields) {
+				s += "\n" + styles.normal.Copy().Faint(true).Render("↓ More parameters below (Ctrl+Down to scroll)")
+			}
+		}
+		
+		// Fill remaining parameter pane space
+		currentParamLines := strings.Count(s[strings.LastIndex(s, "─"):], "\n")
+		for currentParamLines < m.toolLayout.paramHeight+m.toolLayout.infoHeight {
+			s += "\n"
+			currentParamLines++
+		}
+		
+		s += strings.Repeat("─", m.width) // Separator
+
+		// === BOTTOM PANE: Tool Response (Scrollable) ===
+		responseHeader := "Tool Response:"
+		if len(m.toolResponses) > 0 {
+			responseHeader = fmt.Sprintf("Tool Response (%d/%d):", m.selectedResponse+1, len(m.toolResponses))
+		}
+		s += "\n" + styles.header.Render(responseHeader)
+		
+		switch m.toolState {
+		case ToolStateLoading:
+			s += "\n" + styles.loading.Render("Executing tool...")
+		case ToolStateSuccess, ToolStateError:
+			if m.currentResponse != nil {
+				// Response metadata header
+				statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("2")) // Green
+				statusIcon := "✓"
+				if !m.currentResponse.Success {
+					statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("1")) // Red
+					statusIcon = "✗"
+				}
+				
+				timestamp := m.currentResponse.Timestamp.Format("15:04:05")
+				duration := fmt.Sprintf("%.2fms", float64(m.currentResponse.ExecutionTime.Nanoseconds())/1000000)
+				status := "Success"
+				if !m.currentResponse.Success {
+					status = "Error"
+				}
+				
+				metadata := fmt.Sprintf("%s %s | %s | %s", statusIcon, status, timestamp, duration)
+				s += "\n" + statusStyle.Render(metadata)
+				
+				// Show arguments if any
+				if len(m.currentResponse.Arguments) > 0 {
+					argStr := "Args: "
+					argParts := make([]string, 0, len(m.currentResponse.Arguments))
+					for k, v := range m.currentResponse.Arguments {
+						argParts = append(argParts, fmt.Sprintf("%s=%v", k, v))
+					}
+					argStr += strings.Join(argParts, ", ")
+					if len(argStr) > 60 {
+						argStr = argStr[:57] + "..."
+					}
+					s += "\n" + styles.normal.Copy().Faint(true).Render(argStr)
+				}
+				
+				s += "\n" // Separator
+				
+				// Show scrollable response content
+				responseLines := strings.Split(m.currentResponse.PrettyResult, "\n")
+				startIdx := m.toolLayout.responseScroll
+				endIdx := min(startIdx+m.toolLayout.responseHeight-6, len(responseLines)) // Reserve space for metadata
+				
+				for i := startIdx; i < endIdx; i++ {
+					line := responseLines[i]
+					// Apply syntax highlighting for JSON-like content
+					if strings.TrimSpace(line) != "" {
+						if strings.Contains(line, ":") && (strings.Contains(line, "{") || strings.Contains(line, "}")) {
+							// JSON structure - use subtle highlighting
+							s += "\n" + styles.normal.Copy().Foreground(lipgloss.Color("6")).Render(line)
+						} else if strings.HasPrefix(strings.TrimSpace(line), "\"" ) {
+							// String values - green
+							s += "\n" + styles.normal.Copy().Foreground(lipgloss.Color("2")).Render(line)
+						} else {
+							s += "\n" + styles.normal.Render(line)
+						}
+					} else {
+						s += "\n"
+					}
+				}
+				
+				// Show scroll indicators for response
+				if startIdx > 0 || endIdx < len(responseLines) {
+					scrollInfo := ""
+					if startIdx > 0 {
+						scrollInfo += "↑ "
+					}
+					scrollInfo += fmt.Sprintf("[%d-%d/%d]", startIdx+1, min(endIdx, len(responseLines)), len(responseLines))
+					if endIdx < len(responseLines) {
+						scrollInfo += " ↓"
+					}
+					s += "\n" + styles.normal.Copy().Faint(true).Render(scrollInfo)
+				}
+				
+				// Navigation hints
+				if len(m.toolResponses) > 1 {
+					navHint := "← Previous response | Next response →"
+					s += "\n" + styles.normal.Copy().Faint(true).Render(navHint)
+				}
+			} else if m.error != "" {
+				s += "\n" + styles.error.Render("✗ Error: " + m.error)
+			}
+		case ToolStateIdle:
+			s += "\n" + styles.normal.Copy().Faint(true).Render("Press T to test this tool")
+			if len(m.toolResponses) > 0 {
+				s += "\n" + styles.normal.Copy().Faint(true).Render(fmt.Sprintf("Previous results: %d executions (use ← → to browse)", len(m.toolResponses)))
+			}
 		}
 
-		// Instructions based on mode
+		// Instructions at the bottom
 		if m.formState.Mode == FormModeEdit {
 			s += "\n\n" + "Editing field. Type to enter value, Enter to save, Esc to cancel"
 		} else {
-			s += "\n\n" + "↑/↓ navigate, Enter/E edit field, T test tool, Esc back, Q quit"
+			basicControls := "↑/↓ navigate, Enter/E edit, T test, +/- resize panes"
+			scrollControls := "Ctrl+↑↓ scroll params, Shift+↑↓ scroll response"
+			historyControls := "←/→ browse history, Ctrl+R clear history"
+			s += "\n\n" + basicControls + "\n" + scrollControls + "\n" + historyControls + ", Esc back"
 		}
 
-		if m.error != "" {
+		// Only show system errors here (not tool responses)
+		if m.error != "" && m.toolState != ToolStateError {
 			s += "\n" + styles.error.Render("Error: "+m.error)
 		}
 		return s
@@ -1248,6 +1727,8 @@ func main() {
 	// Parse command line flags
 	debugMode := flag.Bool("debug", false, "Start in debug mode")
 	serverCmd := flag.String("server", "", "MCP server command to connect to automatically")
+	proxyMode := flag.Bool("proxy", false, "Start in stdio proxy mode")
+	targetCmd := flag.String("target", "", "Target MCP server command for proxy mode")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "MCP Explorer - A comprehensive terminal UI for debugging and developing with MCP servers\n\n")
@@ -1258,15 +1739,31 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s --debug                   # Start in debug mode\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --server \"python srv.py\"  # Auto-connect to server\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --debug --server \"node server.js\" # Debug mode with auto-connect\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --proxy --target \"python srv.py\" # Stdio proxy mode\n", os.Args[0])
 	}
 	flag.Parse()
+	
+	// Validate proxy mode arguments
+	if *proxyMode && *targetCmd == "" {
+		fmt.Fprintf(os.Stderr, "Error: --target is required when using --proxy mode\n")
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	model := NewModel()
 	
-	// Set initial state based on flags
+	// Handle stdio proxy mode - this runs without TUI
+	if *proxyMode {
+		proxy := NewStdioProxy(*targetCmd)
+		if err := proxy.RunProxy(); err != nil {
+			log.Fatalf("Stdio proxy error: %v", err)
+		}
+		return
+	}
+	
+	// Set initial state based on flags for TUI modes
 	if *debugMode {
 		model.state = StateDebugMode
 		model.debugLayout.messagePaneHeight = int(float64(25) * model.debugLayout.splitRatio) // Default height

@@ -18,6 +18,9 @@ go build -o mcpview .
 # Run in debug mode with live message pane
 ./mcpview --debug
 
+# Run in stdio proxy mode
+./mcpview --proxy --target "python server.py"
+
 # Auto-connect to MCP server
 ./mcpview --server "python my_server.py"
 
@@ -54,9 +57,10 @@ go vet .
 - 📋 Resource content viewing and export
 
 ### Phase 2: MCP Proxy Mode (Core Feature)
-- 📋 Bidirectional proxy between MCP client/server
-- 📋 Real-time message interception and logging
-- 📋 Split-pane UI: live messages + searchable history
+- ✅ Bidirectional proxy between MCP client/server
+- ✅ Real-time message interception and logging
+- ✅ Live connection monitoring with client details
+- ✅ TCP proxy server with automatic MCP server spawning
 - 📋 fzf-style filtering and search capabilities
 - 📋 Message modification/injection for testing
 
@@ -92,6 +96,7 @@ The application follows Pete's Go structure philosophy with everything in a sing
 - `StateResourcesList`: Browse available MCP resources
 - `StateMessageHistory`: Historical message browser
 - `StateDebugMode`: Live debug mode with split-pane message view
+- `StateProxyMode`: Proxy server mode with connection monitoring
 
 ### Planned Components
 - **ProxyManager**: Bidirectional MCP proxy with interception
@@ -152,15 +157,23 @@ Live debugging interface with split-pane layout:
   - Tool testing while watching traffic
   - Compact message display with method/response info
 
-### Proxy Mode (Planned)
-Transparent proxy between MCP client and server with full message inspection:
+### Proxy Mode (Current)
+Stdio-based transparent proxy between MCP client and server:
 ```bash
-# Start proxy
-./mcpview --proxy --listen :8080 --target "python server.py"
+# Use mcpview as an MCP server that proxies to the real server
+./mcpview --proxy --target "python server.py"
 
-# Client connects to proxy instead of server directly
-# All messages flow through mcpview for inspection/modification
+# MCP client spawns mcpview instead of the real server
+# All messages flow through mcpview for inspection
 ```
+
+**Features:**
+- Stdio transport proxy (proper MCP protocol)
+- Transparent message forwarding between client and target server
+- Real-time message interception and logging
+- Works with any MCP client (Claude desktop, MCP libraries, etc.)
+- Automatic target server process management
+- Full message visibility without client changes
 
 ## Development Notes
 
