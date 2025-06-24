@@ -1,89 +1,61 @@
 # MCP Explorer
 
-A terminal UI application for exploring MCP (Model Context Protocol) servers, written in Go.
+**A terminal UI for developing, debugging, and testing MCP (Model Context Protocol) servers.**
+
+Live message monitoring • Tool testing with dynamic forms • Transparent proxy mode • Response history
 
 ## Features
 
-- Connect to MCP servers via stdio transport
-- Browse available tools and their schemas
-- Test tool invocations
-- Explore server resources
-- Interactive terminal UI with keyboard navigation
+- 🔍 **Debug Mode** - Live message monitoring with split-pane interface
+- 🛠️ **Tool Testing** - Dynamic parameter forms generated from JSON schemas  
+- 🔄 **Proxy Mode** - Transparent stdio proxy for inspecting any MCP communication
+- 📊 **Response History** - Navigate through execution history with syntax highlighting
+- ⚡ **Real-time** - Watch MCP traffic flow in real-time with timestamps
+
+## Installation
+
+```bash
+go install github.com/kungfusheep/mcpview@latest
+```
+
+Or build from source:
+```bash
+git clone https://github.com/kungfusheep/mcpview
+cd mcpview
+go build -o mcpview .
+```
 
 ## Usage
 
+### Explorer Mode (Direct Connection)
 ```bash
-go build -o mcpview .
-./mcpview
+# Connect directly to an MCP server
+mcpview --server "python my_server.py"
+
+# Debug mode with live message monitoring
+mcpview --debug --server "npx @modelcontextprotocol/server-filesystem /"
 ```
 
-The application will start in connection mode where you can enter an MCP server command.
-
-### Example MCP Server Commands
-
+### Proxy Mode (Transparent Debugging)
 ```bash
-# Python MCP server
-python my_mcp_server.py
+# Use mcpview as a transparent proxy
+mcpview --proxy --target "python server.py"
 
-# Node.js MCP server  
-node server.js
-
-# Any executable that implements MCP stdio transport
-./my-server --stdio
+# Then configure your MCP client to use mcpview instead of the server
 ```
 
-## Navigation
+### Interactive Mode
+```bash
+# Start with connection prompt
+mcpview
+```
 
-### Connection Screen
-- Type your MCP server command
-- Press Enter to connect
-- Ctrl+C or Q to quit
+**Key Controls:** `↑↓/jk` navigate • `Enter` select • `T` test tool • `M` messages • `D` debug • `Q` quit
 
-### Tools List
-- ↑/↓ or K/J to navigate tools
-- Enter to view tool details and schema
-- R to view resources
-- C to reconnect to a different server
-- Q to quit
+## What is MCP?
 
-### Tool Details
-- View tool name, description, and dynamically generated parameter form
-- ↑/↓ or K/J to navigate between parameters
-- Enter or E to edit a parameter value
-- T to test the tool with current parameter values
-- Esc to go back
-- Q to quit
+[Model Context Protocol](https://modelcontextprotocol.io) enables applications to provide context to LLMs in a standardized way. MCP Explorer helps you develop and debug MCP servers by providing visibility into the protocol communication.
 
-### Parameter Editing
-- Type to enter value for the selected parameter
-- Enter to save the value
-- Esc to cancel editing
-- Supports different field types: string, number, boolean, array, object
-- Shows field descriptions and enum options where available
-- Required fields are marked with *
+## License
 
-### Resources List
-- ↑/↓ or K/J to navigate resources
-- Esc to go back to tools
-- Q to quit
-
-## MCP Protocol Support
-
-The application implements the core MCP protocol methods:
-
-- `initialize` - Server initialization and capability negotiation
-- `tools/list` - Discover available tools
-- `tools/call` - Invoke tools with arguments
-- `resources/list` - List available resources
-
-## Architecture
-
-Following Pete's Go structure philosophy, the entire application is contained in a single `mcpview.go` file with:
-
-- Main entry point with `func main()`
-- MCP client implementation using stdio transport
-- Bubbletea TUI models and views
-- JSON-RPC 2.0 message handling
-- All application logic in one discoverable location
-
-The code is structured with clear separation using structs and methods for encapsulation while keeping everything in one file for easy understanding and debugging.
+MIT License - see LICENSE file for details.
