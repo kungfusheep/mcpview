@@ -22,6 +22,10 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// Session socket buffers (maps socket connection to its buffer)
+var sessionSocketBuffers = make(map[net.Conn]string)
+var socketBufferMutex = sync.RWMutex{}
+
 // JSON-RPC 2.0 message types
 type JSONRPCRequest struct {
 	JSONRPC string      `json:"jsonrpc"`
@@ -1198,6 +1202,7 @@ type ToolResponseMsg struct{ response ToolResponse }
 type ToolExecutionStartMsg struct{}
 type SessionAttachedMsg struct{ Session ProxySession; Socket net.Conn }
 type SessionMessageMsg struct{ message LoggedMessage }
+type SessionMessagesMsg struct{ messages []LoggedMessage }
 
 func NewModel() Model {
 	client := NewMCPClient()
@@ -1331,6 +1336,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Initialize selection to show latest message
 		m.selectedSessionMessage = max(0, len(m.sessionMessages)-1) // Select latest message
 		
+		// Initialize session buffer for socket reading
+		socketBufferMutex.Lock()
+		sessionSocketBuffers[msg.Socket] = ""
+		socketBufferMutex.Unlock()
+		
 		// Initialize session layout
 		m.sessionLayout = SessionLayout{
 			totalHeight:   m.height,
@@ -1346,31 +1356,46 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Start listening for messages from the session
 		return m, m.listenToSession()
 
-	case SessionMessageMsg:
-		// New message received from attached session
-		m.sessionMessages = append(m.sessionMessages, msg.message)
+	case SessionMessagesMsg:
+		// Multiple new messages received from attached session
+		if len(msg.messages) == 0 {
+			return m, m.listenToSession() // Continue listening
+		}
 		
 		// Auto-follow latest messages (but allow user to scroll up to pause auto-follow)
 		atBottom := m.selectedSessionMessage >= max(0, len(m.sessionMessages)-2) // Within 1 message of bottom
 		
-		if len(m.sessionMessages) > 100 { // Keep last 100 messages for performance
-			m.sessionMessages = m.sessionMessages[1:]
-			// Adjust scroll and selection if they're out of bounds
-			if m.sessionLayout.messageScroll > 0 {
-				m.sessionLayout.messageScroll--
+		// Add all new messages
+		m.sessionMessages = append(m.sessionMessages, msg.messages...)
+		
+		// Trim to keep last 100 messages for performance
+		if len(m.sessionMessages) > 100 {
+			excess := len(m.sessionMessages) - 100
+			m.sessionMessages = m.sessionMessages[excess:]
+			// Adjust scroll and selection 
+			if m.sessionLayout.messageScroll > excess {
+				m.sessionLayout.messageScroll = max(0, m.sessionLayout.messageScroll-excess)
+			} else {
+				m.sessionLayout.messageScroll = 0
 			}
-			if m.selectedSessionMessage > 0 {
-				m.selectedSessionMessage--
+			if m.selectedSessionMessage >= excess {
+				m.selectedSessionMessage = max(0, m.selectedSessionMessage-excess)
+			} else {
+				m.selectedSessionMessage = 0
 			}
 		}
 		
-		// If user was at bottom, auto-follow new message
+		// If user was at bottom, auto-follow new messages
 		if atBottom {
 			m.selectedSessionMessage = max(0, len(m.sessionMessages)-1)
 			m.sessionLayout.messageScroll = max(0, len(m.sessionMessages)-m.sessionLayout.messageHeight)
 		}
 		
 		return m, m.listenToSession() // Continue listening
+
+	case SessionMessageMsg:
+		// Single message received - convert to multi-message handler
+		return m.Update(SessionMessagesMsg{messages: []LoggedMessage{msg.message}})
 
 	case ErrorMsg:
 		m.error = msg.err.Error()
@@ -1709,12 +1734,20 @@ func (m Model) updateSessionViewer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c", "q":
 		// Close socket connection before quitting
 		if m.sessionSocket != nil {
+			// Clean up socket buffer
+			socketBufferMutex.Lock()
+			delete(sessionSocketBuffers, m.sessionSocket)
+			socketBufferMutex.Unlock()
 			m.sessionSocket.Close()
 		}
 		return m, tea.Quit
 	case "esc":
 		// Detach from session and return to session list
 		if m.sessionSocket != nil {
+			// Clean up socket buffer
+			socketBufferMutex.Lock()
+			delete(sessionSocketBuffers, m.sessionSocket)
+			socketBufferMutex.Unlock()
 			m.sessionSocket.Close()
 			m.sessionSocket = nil
 		}
@@ -1810,54 +1843,77 @@ func (m Model) listenToSession() tea.Cmd {
 			return ErrorMsg{fmt.Errorf("session disconnected: %v", err)}
 		}
 		
-		// Parse the received data as a logged message
-		var loggedMsg LoggedMessage
-		if err := json.Unmarshal(buf[:n], &loggedMsg); err != nil {
-			// If JSON parsing fails, try to parse as raw JSON and create a message
-			var jsonObj interface{}
-			if jsonErr := json.Unmarshal(buf[:n], &jsonObj); jsonErr == nil {
-				// Pretty-print the JSON content
-				if prettyBytes, prettyErr := json.MarshalIndent(jsonObj, "", "  "); prettyErr == nil {
-					loggedMsg = LoggedMessage{
-						Content:   buf[:n],
-						Timestamp: time.Now(),
-						Direction: DirectionInbound,
-						Pretty:    string(prettyBytes),
+		// Add new data to buffer
+		socketBufferMutex.Lock()
+		currentBuffer := sessionSocketBuffers[m.sessionSocket]
+		currentBuffer += string(buf[:n])
+		
+		// Split buffer by newlines to get individual messages
+		lines := strings.Split(currentBuffer, "\n")
+		
+		// Keep the last line (might be incomplete) in buffer
+		sessionSocketBuffers[m.sessionSocket] = lines[len(lines)-1]
+		socketBufferMutex.Unlock()
+		
+		// Process all complete lines (all but the last one)
+		var messages []LoggedMessage
+		for _, line := range lines[:len(lines)-1] {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue // Skip empty lines
+			}
+			
+			// Try to parse as LoggedMessage JSON
+			var loggedMsg LoggedMessage
+			if err := json.Unmarshal([]byte(line), &loggedMsg); err != nil {
+				// If LoggedMessage parsing fails, try to parse as raw JSON
+				var jsonObj interface{}
+				if jsonErr := json.Unmarshal([]byte(line), &jsonObj); jsonErr == nil {
+					// Successfully parsed as JSON - create LoggedMessage
+					if prettyBytes, prettyErr := json.MarshalIndent(jsonObj, "", "  "); prettyErr == nil {
+						loggedMsg = LoggedMessage{
+							Content:   []byte(line),
+							Timestamp: time.Now(),
+							Direction: DirectionInbound,
+							Pretty:    string(prettyBytes),
+						}
+					} else {
+						loggedMsg = LoggedMessage{
+							Content:   []byte(line),
+							Timestamp: time.Now(),
+							Direction: DirectionInbound,
+							Pretty:    line,
+						}
 					}
 				} else {
+					// Not JSON, treat as raw text message
 					loggedMsg = LoggedMessage{
-						Content:   buf[:n],
+						Content:   []byte(line),
 						Timestamp: time.Now(),
 						Direction: DirectionInbound,
-						Pretty:    string(buf[:n]),
+						Pretty:    line,
 					}
 				}
 			} else {
-				// Not JSON, treat as raw message
-				loggedMsg = LoggedMessage{
-					Content:   buf[:n],
-					Timestamp: time.Now(),
-					Direction: DirectionInbound,
-					Pretty:    string(buf[:n]),
-				}
-			}
-		} else {
-			// Successfully parsed as LoggedMessage, ensure Pretty field is set
-			if loggedMsg.Pretty == "" {
-				var jsonObj interface{}
-				if jsonErr := json.Unmarshal(loggedMsg.Content, &jsonObj); jsonErr == nil {
-					if prettyBytes, prettyErr := json.MarshalIndent(jsonObj, "", "  "); prettyErr == nil {
-						loggedMsg.Pretty = string(prettyBytes)
+				// Successfully parsed as LoggedMessage, ensure Pretty field is set
+				if loggedMsg.Pretty == "" {
+					var jsonObj interface{}
+					if jsonErr := json.Unmarshal(loggedMsg.Content, &jsonObj); jsonErr == nil {
+						if prettyBytes, prettyErr := json.MarshalIndent(jsonObj, "", "  "); prettyErr == nil {
+							loggedMsg.Pretty = string(prettyBytes)
+						} else {
+							loggedMsg.Pretty = string(loggedMsg.Content)
+						}
 					} else {
 						loggedMsg.Pretty = string(loggedMsg.Content)
 					}
-				} else {
-					loggedMsg.Pretty = string(loggedMsg.Content)
 				}
 			}
+			
+			messages = append(messages, loggedMsg)
 		}
 		
-		return SessionMessageMsg{message: loggedMsg}
+		return SessionMessagesMsg{messages: messages}
 	}
 }
 
