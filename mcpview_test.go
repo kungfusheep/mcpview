@@ -12,7 +12,7 @@ import (
 func TestSessionRegistry(t *testing.T) {
 	// Create a temporary directory for testing
 	tempDir := t.TempDir()
-	
+
 	registry := &SessionRegistry{
 		basePath: tempDir,
 	}
@@ -162,25 +162,25 @@ func TestProxySessionSerialization(t *testing.T) {
 func TestProxyMessageLogging(t *testing.T) {
 	t.Run("MessageLoggingWithSession", func(t *testing.T) {
 		proxy := NewStdioProxyWithSession("echo test", "test-session")
-		
+
 		// Test message logging
 		testMessage := []byte(`{"jsonrpc": "2.0", "method": "initialize", "id": 1}`)
 		proxy.logMessage(DirectionOutbound, testMessage)
-		
+
 		messages := proxy.GetMessageLog()
 		if len(messages) != 1 {
 			t.Fatalf("Expected 1 message, got %d", len(messages))
 		}
-		
+
 		msg := messages[0]
 		if msg.Direction != DirectionOutbound {
 			t.Errorf("Expected outbound direction, got %v", msg.Direction)
 		}
-		
+
 		if string(msg.Content) != string(testMessage) {
 			t.Errorf("Expected message content %s, got %s", string(testMessage), string(msg.Content))
 		}
-		
+
 		// Verify pretty-printing worked
 		if msg.Pretty == "" {
 			t.Error("Expected pretty-printed message, got empty string")
@@ -189,18 +189,78 @@ func TestProxyMessageLogging(t *testing.T) {
 
 	t.Run("MessageLoggingWithoutSession", func(t *testing.T) {
 		proxy := NewStdioProxy("echo test")
-		
+
 		// Should work the same way without session
 		testMessage := []byte(`{"jsonrpc": "2.0", "method": "tools/list"}`)
 		proxy.logMessage(DirectionInbound, testMessage)
-		
+
 		messages := proxy.GetMessageLog()
 		if len(messages) != 1 {
 			t.Fatalf("Expected 1 message, got %d", len(messages))
 		}
-		
+
 		if messages[0].Direction != DirectionInbound {
 			t.Error("Expected inbound direction")
+		}
+	})
+
+	t.Run("MessagePersistenceIntegration", func(t *testing.T) {
+		// Test that proxy actually persists messages to session storage
+		tempDir := t.TempDir()
+		sessionName := "persistence-test"
+
+		proxy := NewStdioProxyWithSessionAndDir("echo test", sessionName, tempDir)
+
+		// Create session directory first
+		registry := NewSessionRegistryWithPath(tempDir)
+		err := registry.createSession(sessionName, "echo test", 12345)
+		if err != nil {
+			t.Fatalf("Failed to create session: %v", err)
+		}
+
+		// Log some messages
+		messages := [][]byte{
+			[]byte(`{"jsonrpc": "2.0", "method": "initialize", "id": 1}`),
+			[]byte(`{"jsonrpc": "2.0", "result": {"capabilities": {}}, "id": 1}`),
+			[]byte(`{"jsonrpc": "2.0", "method": "tools/list"}`),
+		}
+
+		directions := []MessageDirection{DirectionOutbound, DirectionInbound, DirectionOutbound}
+
+		for i, msgBytes := range messages {
+			proxy.logMessage(directions[i], msgBytes)
+		}
+
+		// Load messages from session storage
+		persistedMessages, err := registry.loadMessagesFromSession(sessionName)
+		if err != nil {
+			t.Fatalf("Failed to load persisted messages: %v", err)
+		}
+
+		// Verify that all messages were persisted
+		if len(persistedMessages) != len(messages) {
+			t.Fatalf("Expected %d persisted messages, got %d", len(messages), len(persistedMessages))
+		}
+
+		// Verify content matches
+		for i, originalBytes := range messages {
+			persistedMsg := persistedMessages[i]
+
+			// Parse both to compare semantically
+			var original, persisted interface{}
+			json.Unmarshal(originalBytes, &original)
+			json.Unmarshal(persistedMsg.Content, &persisted)
+
+			originalStr, _ := json.Marshal(original)
+			persistedStr, _ := json.Marshal(persisted)
+
+			if string(originalStr) != string(persistedStr) {
+				t.Errorf("Message %d: content mismatch between original and persisted", i)
+			}
+
+			if persistedMsg.Direction != directions[i] {
+				t.Errorf("Message %d: direction mismatch. Expected %v, got %v", i, directions[i], persistedMsg.Direction)
+			}
 		}
 	})
 }
@@ -265,7 +325,7 @@ func TestSessionListing(t *testing.T) {
 		err1 := registry.createSession("session1", "cmd1", 100)
 		err2 := registry.createSession("session2", "cmd2", 200)
 		err3 := registry.createSession("session3", "cmd3", 300)
-		
+
 		if err1 != nil || err2 != nil || err3 != nil {
 			t.Fatalf("Failed to create test sessions: %v, %v, %v", err1, err2, err3)
 		}
@@ -354,7 +414,7 @@ func TestSessionCleanup(t *testing.T) {
 		if registry.isProcessAlive(-1) {
 			t.Error("Invalid PID should not be alive")
 		}
-		
+
 		if registry.isProcessAlive(0) {
 			t.Error("PID 0 should not be alive")
 		}
@@ -377,44 +437,44 @@ func TestSessionCleanup(t *testing.T) {
 func TestConfigurableSessionsDirectory(t *testing.T) {
 	tempDir := t.TempDir()
 	customSessionsDir := filepath.Join(tempDir, "custom-sessions")
-	
+
 	t.Run("CustomSessionsDirectory", func(t *testing.T) {
 		registry := NewSessionRegistryWithPath(customSessionsDir)
-		
+
 		// Create a session in the custom directory
 		err := registry.createSession("custom-test", "echo hello", 12345)
 		if err != nil {
 			t.Fatalf("Failed to create session in custom directory: %v", err)
 		}
-		
+
 		// Verify the session was created in the right place
 		expectedPath := filepath.Join(customSessionsDir, "custom-test", "metadata.json")
 		if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
 			t.Fatalf("Session metadata not found at expected path: %s", expectedPath)
 		}
-		
+
 		// Verify we can list sessions from the custom directory
 		sessions, err := registry.listSessions()
 		if err != nil {
 			t.Fatalf("Failed to list sessions from custom directory: %v", err)
 		}
-		
+
 		if len(sessions) != 1 {
 			t.Fatalf("Expected 1 session, got %d", len(sessions))
 		}
-		
+
 		if sessions[0].Name != "custom-test" {
 			t.Errorf("Expected session name 'custom-test', got '%s'", sessions[0].Name)
 		}
 	})
-	
+
 	t.Run("ProxyWithCustomDirectory", func(t *testing.T) {
 		proxy := NewStdioProxyWithSessionAndDir("echo test", "proxy-test", customSessionsDir)
-		
+
 		if proxy.sessionName != "proxy-test" {
 			t.Errorf("Expected session name 'proxy-test', got '%s'", proxy.sessionName)
 		}
-		
+
 		if proxy.sessionsDir != customSessionsDir {
 			t.Errorf("Expected sessions dir '%s', got '%s'", customSessionsDir, proxy.sessionsDir)
 		}
@@ -425,39 +485,39 @@ func TestUnixSocketStreaming(t *testing.T) {
 	// Use /tmp for shorter paths to avoid Unix socket path length limits
 	sessionsDir := "/tmp/mcpview-test-" + fmt.Sprintf("%d", time.Now().UnixNano())
 	defer os.RemoveAll(sessionsDir)
-	
+
 	t.Run("SocketPathGeneration", func(t *testing.T) {
 		proxy := NewStdioProxyWithSessionAndDir("echo test", "test", sessionsDir)
-		
+
 		expectedPath := filepath.Join(sessionsDir, "test", "socket")
 		if proxy.socketPath != expectedPath {
 			t.Errorf("Expected socket path '%s', got '%s'", expectedPath, proxy.socketPath)
 		}
 	})
-	
+
 	t.Run("SocketServerCreation", func(t *testing.T) {
 		proxy := NewStdioProxyWithSessionAndDir("echo test", "test", sessionsDir)
-		
+
 		t.Logf("Socket path: %s (length: %d)", proxy.socketPath, len(proxy.socketPath))
-		
+
 		// Create the session directory first
 		registry := NewSessionRegistryWithPath(sessionsDir)
 		err := registry.createSession("test", "echo test", 12345)
 		if err != nil {
 			t.Fatalf("Failed to create session: %v", err)
 		}
-		
+
 		// Test socket server startup
 		err = proxy.startSocketServer()
 		if err != nil {
 			t.Fatalf("Failed to start socket server: %v", err)
 		}
-		
+
 		// Verify socket file exists
 		if _, err := os.Stat(proxy.socketPath); os.IsNotExist(err) {
 			t.Fatalf("Socket file not created at %s", proxy.socketPath)
 		}
-		
+
 		// Cleanup
 		if proxy.socketListener != nil {
 			proxy.socketListener.Close()
@@ -578,7 +638,7 @@ func TestLoadSystemWords(t *testing.T) {
 		// This test checks if system words can be loaded
 		// It may pass or fail depending on the system, but shouldn't crash
 		words, err := loadSystemWords()
-		
+
 		if err != nil {
 			// It's OK if no system word list is found
 			t.Logf("No system word list found (this is OK): %v", err)
@@ -616,7 +676,7 @@ func TestGenerateRandomSessionName(t *testing.T) {
 		names := make(map[string]bool)
 		for i := 0; i < 5; i++ {
 			name := generateRandomSessionName()
-			
+
 			// Check basic format: word1-word2-MMDD-HHMM
 			parts := fmt.Sprintf("%s", name)
 			if parts == "" {
@@ -653,14 +713,14 @@ func TestGenerateRandomSessionName(t *testing.T) {
 		// Generate many names quickly to test uniqueness
 		names := make(map[string]bool)
 		duplicates := 0
-		
+
 		for i := 0; i < 100; i++ {
 			name := generateRandomSessionName()
 			if names[name] {
 				duplicates++
 			}
 			names[name] = true
-			
+
 			// Small delay to ensure different timestamps
 			time.Sleep(time.Millisecond)
 		}
@@ -679,31 +739,31 @@ func TestSessionNameIntegration(t *testing.T) {
 		// Test that session creation with auto-generated names works
 		tempDir := t.TempDir()
 		registry := &SessionRegistry{basePath: tempDir}
-		
+
 		// Test with explicit session name
 		explicitName := "my-test-session"
 		err := registry.createSession(explicitName, "echo test", 12345)
 		if err != nil {
 			t.Fatalf("Failed to create session with explicit name: %v", err)
 		}
-		
+
 		// Test with auto-generated session name
 		autoName := generateRandomSessionName()
 		err = registry.createSession(autoName, "echo test", 12346)
 		if err != nil {
 			t.Fatalf("Failed to create session with auto-generated name: %v", err)
 		}
-		
+
 		// Verify both sessions exist
 		sessions, err := registry.listSessions()
 		if err != nil {
 			t.Fatalf("Failed to list sessions: %v", err)
 		}
-		
+
 		if len(sessions) != 2 {
 			t.Fatalf("Expected 2 sessions, got %d", len(sessions))
 		}
-		
+
 		// Find the sessions by name
 		foundExplicit := false
 		foundAuto := false
@@ -715,25 +775,142 @@ func TestSessionNameIntegration(t *testing.T) {
 				foundAuto = true
 			}
 		}
-		
+
 		if !foundExplicit {
 			t.Errorf("Explicit session %q not found", explicitName)
 		}
 		if !foundAuto {
 			t.Errorf("Auto-generated session %q not found", autoName)
 		}
-		
+
 		t.Logf("Successfully created sessions: %q and %q", explicitName, autoName)
 	})
-	
+
 	t.Run("SessionNameValidation", func(t *testing.T) {
 		// Test that empty session names are handled
 		tempDir := t.TempDir()
 		registry := &SessionRegistry{basePath: tempDir}
-		
+
 		err := registry.createSession("", "echo test", 12345)
 		if err == nil {
 			t.Error("Expected error for empty session name, got nil")
 		}
 	})
 }
+
+func TestSessionMessagePersistence(t *testing.T) {
+	tempDir := t.TempDir()
+	registry := &SessionRegistry{basePath: tempDir}
+	sessionName := "message-test-session"
+
+	// Create a session first
+	err := registry.createSession(sessionName, "echo test", 12345)
+	if err != nil {
+		t.Fatalf("Failed to create session: %v", err)
+	}
+
+	t.Run("SaveAndLoadMessages", func(t *testing.T) {
+		// Create test messages
+		messages := []LoggedMessage{
+			{
+				Timestamp: time.Now().Add(-10 * time.Minute),
+				Direction: DirectionOutbound,
+				Content:   json.RawMessage(`{"jsonrpc": "2.0", "method": "initialize", "id": 1}`),
+				Pretty:    "{\n  \"jsonrpc\": \"2.0\",\n  \"method\": \"initialize\",\n  \"id\": 1\n}",
+			},
+			{
+				Timestamp: time.Now().Add(-8 * time.Minute),
+				Direction: DirectionInbound,
+				Content:   json.RawMessage(`{"jsonrpc": "2.0", "result": {"capabilities": {}}, "id": 1}`),
+				Pretty:    "{\n  \"jsonrpc\": \"2.0\",\n  \"result\": {\n    \"capabilities\": {}\n  },\n  \"id\": 1\n}",
+			},
+			{
+				Timestamp: time.Now().Add(-5 * time.Minute),
+				Direction: DirectionOutbound,
+				Content:   json.RawMessage(`{"jsonrpc": "2.0", "method": "tools/list"}`),
+				Pretty:    "{\n  \"jsonrpc\": \"2.0\",\n  \"method\": \"tools/list\"\n}",
+			},
+		}
+
+		// Save messages one by one
+		for _, msg := range messages {
+			err := registry.saveMessageToSession(sessionName, msg)
+			if err != nil {
+				t.Fatalf("Failed to save message: %v", err)
+			}
+		}
+
+		// Load messages back
+		loadedMessages, err := registry.loadMessagesFromSession(sessionName)
+		if err != nil {
+			t.Fatalf("Failed to load messages: %v", err)
+		}
+
+		// Verify message count
+		if len(loadedMessages) != len(messages) {
+			t.Fatalf("Expected %d messages, got %d", len(messages), len(loadedMessages))
+		}
+
+		// Verify message content
+		for i, original := range messages {
+			loaded := loadedMessages[i]
+
+			if loaded.Direction != original.Direction {
+				t.Errorf("Message %d: direction mismatch. Expected %v, got %v", i, original.Direction, loaded.Direction)
+			}
+
+			// Compare JSON content semantically (order-independent)
+			var originalJSON, loadedJSON interface{}
+			if err := json.Unmarshal(original.Content, &originalJSON); err != nil {
+				t.Fatalf("Failed to unmarshal original content: %v", err)
+			}
+			if err := json.Unmarshal(loaded.Content, &loadedJSON); err != nil {
+				t.Fatalf("Failed to unmarshal loaded content: %v", err)
+			}
+
+			// Compare the parsed JSON structures
+			originalStr, _ := json.Marshal(originalJSON)
+			loadedStr, _ := json.Marshal(loadedJSON)
+			if string(originalStr) != string(loadedStr) {
+				t.Errorf("Message %d: JSON content mismatch. Expected %s, got %s", i, string(originalStr), string(loadedStr))
+			}
+
+			// Verify timestamps are preserved (within 1 second for test tolerance)
+			timeDiff := loaded.Timestamp.Sub(original.Timestamp)
+			if timeDiff > time.Second || timeDiff < -time.Second {
+				t.Errorf("Message %d: timestamp not preserved. Diff: %v", i, timeDiff)
+			}
+		}
+	})
+
+	t.Run("EmptySessionMessages", func(t *testing.T) {
+		// Test loading from a session with no messages
+		emptySession := "empty-session"
+		err := registry.createSession(emptySession, "echo test", 12346)
+		if err != nil {
+			t.Fatalf("Failed to create empty session: %v", err)
+		}
+
+		messages, err := registry.loadMessagesFromSession(emptySession)
+		if err != nil {
+			t.Fatalf("Failed to load from empty session: %v", err)
+		}
+
+		if len(messages) != 0 {
+			t.Errorf("Expected 0 messages from empty session, got %d", len(messages))
+		}
+	})
+
+	t.Run("NonexistentSession", func(t *testing.T) {
+		// Test loading from a session that doesn't exist
+		messages, err := registry.loadMessagesFromSession("nonexistent")
+		if err != nil {
+			t.Fatalf("Expected no error for nonexistent session, got: %v", err)
+		}
+
+		if len(messages) != 0 {
+			t.Errorf("Expected 0 messages from nonexistent session, got %d", len(messages))
+		}
+	})
+}
+
