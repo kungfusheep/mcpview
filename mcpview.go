@@ -26,6 +26,97 @@ import (
 var sessionSocketBuffers = make(map[net.Conn]string)
 var socketBufferMutex = sync.RWMutex{}
 
+// loadSystemWords attempts to load words from system word lists
+func loadSystemWords() ([]string, error) {
+	// Common system word list locations
+	wordListPaths := []string{
+		"/usr/share/dict/words",
+		"/usr/dict/words", 
+		"/usr/share/words",
+		"/opt/local/share/dict/words", // MacPorts
+		"/usr/local/share/dict/words", // Homebrew
+	}
+	
+	for _, path := range wordListPaths {
+		if words, err := readWordList(path); err == nil {
+			return words, nil
+		}
+	}
+	
+	return nil, fmt.Errorf("no system word list found")
+}
+
+// readWordList reads words from a file, filtering for suitable session names
+func readWordList(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	
+	var words []string
+	scanner := bufio.NewScanner(file)
+	
+	for scanner.Scan() {
+		word := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		// Filter for good session name words (3-8 chars, letters only)
+		if len(word) >= 3 && len(word) <= 8 && isAlphaOnly(word) {
+			words = append(words, word)
+			if len(words) >= 1000 { // Limit to first 1000 suitable words for performance
+				break
+			}
+		}
+	}
+	
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	
+	if len(words) == 0 {
+		return nil, fmt.Errorf("no suitable words found")
+	}
+	
+	return words, nil
+}
+
+// isAlphaOnly checks if string contains only letters
+func isAlphaOnly(s string) bool {
+	for _, r := range s {
+		if r < 'a' || r > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
+// generateRandomSessionName creates a random session name for proxy mode
+func generateRandomSessionName() string {
+	timestamp := time.Now().Format("0102-1504") // MMDD-HHMM format
+	
+	// Try to use system word list first
+	var words []string
+	if systemWords, err := loadSystemWords(); err == nil && len(systemWords) > 20 {
+		words = systemWords
+	} else {
+		// Fallback to curated lists
+		adjectives := []string{"swift", "bright", "quiet", "bold", "smart", "quick", "clean", "neat", "cool", "warm", "fast", "slow", "dark", "light", "deep", "wide", "tall", "short", "new", "old"}
+		nouns := []string{"proxy", "session", "debug", "trace", "monitor", "watch", "link", "bridge", "tunnel", "relay", "pipe", "flow", "stream", "channel", "wire", "socket", "port", "gate", "node", "hub"}
+		words = append(adjectives, nouns...)
+	}
+	
+	// Simple pseudo-random selection based on current time  
+	now := time.Now().UnixNano()
+	word1 := words[now%int64(len(words))]
+	word2 := words[(now/1000)%int64(len(words))]
+	
+	// Ensure we get two different words
+	if word1 == word2 && len(words) > 1 {
+		word2 = words[(now/2000)%int64(len(words))]
+	}
+	
+	return fmt.Sprintf("%s-%s-%s", word1, word2, timestamp)
+}
+
 // JSON-RPC 2.0 message types
 type JSONRPCRequest struct {
 	JSONRPC string      `json:"jsonrpc"`
@@ -2737,7 +2828,7 @@ func main() {
 	serverCmd := flag.String("server", "", "MCP server command to connect to automatically")
 	proxyMode := flag.Bool("proxy", false, "Start in stdio proxy mode")
 	targetCmd := flag.String("target", "", "Target MCP server command for proxy mode")
-	sessionName := flag.String("session", "", "Session name for proxy mode")
+	sessionName := flag.String("session", "", "Session name for proxy mode (auto-generated if not provided)")
 	listSessions := flag.Bool("list-sessions", false, "List active proxy sessions and exit")
 	sessionsDir := flag.String("sessions-dir", "/tmp/mcpview-sessions", "Directory to store session metadata")
 	attachMode := flag.Bool("attach", false, "Show session list for attaching to running sessions")
@@ -2751,7 +2842,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s --debug                   # Start in debug mode\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --server \"python srv.py\"  # Auto-connect to server\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --debug --server \"node server.js\" # Debug mode with auto-connect\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s --proxy --target \"python srv.py\" # Stdio proxy mode\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --proxy --target \"python srv.py\" # Stdio proxy mode (auto-named session)\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --proxy --target \"python srv.py\" --session \"myapi\" # Named proxy session\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --sessions-dir ./sessions --list-sessions # Use local sessions directory\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --attach # Show interactive session list for debugging\n", os.Args[0])
@@ -2848,11 +2939,17 @@ func main() {
 	// Handle stdio proxy mode - this runs without TUI
 	if *proxyMode {
 		var proxy *StdioProxy
+		var actualSessionName string
+		
 		if *sessionName != "" {
-			proxy = NewStdioProxyWithSessionAndDir(*targetCmd, *sessionName, *sessionsDir)
+			actualSessionName = *sessionName
 		} else {
-			proxy = NewStdioProxy(*targetCmd)
+			// Generate random session name when not provided
+			actualSessionName = generateRandomSessionName()
+			fmt.Fprintf(os.Stderr, "Generated session name: %s\n", actualSessionName)
 		}
+		
+		proxy = NewStdioProxyWithSessionAndDir(*targetCmd, actualSessionName, *sessionsDir)
 		if err := proxy.RunProxy(); err != nil {
 			log.Fatalf("Stdio proxy error: %v", err)
 		}

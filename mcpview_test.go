@@ -465,3 +465,275 @@ func TestUnixSocketStreaming(t *testing.T) {
 		os.Remove(proxy.socketPath)
 	})
 }
+
+func TestIsAlphaOnly(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{"hello", true},
+		{"world", true},
+		{"abc", true},
+		{"", true}, // empty string should be considered alpha-only
+		{"hello123", false},
+		{"hello-world", false},
+		{"hello_world", false},
+		{"Hello", false}, // uppercase not allowed
+		{"test@example", false},
+		{"test.com", false},
+		{"test/path", false},
+		{"café", false}, // non-ASCII not allowed
+	}
+
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("isAlphaOnly_%s", test.input), func(t *testing.T) {
+			result := isAlphaOnly(test.input)
+			if result != test.expected {
+				t.Errorf("isAlphaOnly(%q) = %v, expected %v", test.input, result, test.expected)
+			}
+		})
+	}
+}
+
+func TestReadWordList(t *testing.T) {
+	t.Run("ValidWordList", func(t *testing.T) {
+		// Create a temporary word list file
+		tempFile := filepath.Join(t.TempDir(), "words")
+		content := "apple\nbanana\ncat\ndog\nelephant\nverylongwordthatshouldbeskipped\ntest123\nvalid\n\n  \nword\n"
+		err := os.WriteFile(tempFile, []byte(content), 0644)
+		if err != nil {
+			t.Fatalf("Failed to create test word file: %v", err)
+		}
+
+		words, err := readWordList(tempFile)
+		if err != nil {
+			t.Fatalf("readWordList failed: %v", err)
+		}
+
+		expectedWords := []string{"apple", "banana", "cat", "dog", "elephant", "valid", "word"}
+		if len(words) != len(expectedWords) {
+			t.Errorf("Expected %d words, got %d. Words: %v", len(expectedWords), len(words), words)
+		}
+
+		// Check that all expected words are present
+		wordMap := make(map[string]bool)
+		for _, word := range words {
+			wordMap[word] = true
+		}
+
+		for _, expected := range expectedWords {
+			if !wordMap[expected] {
+				t.Errorf("Expected word %q not found in result", expected)
+			}
+		}
+
+		// Verify filtering worked (no long words, no numbers, no empty)
+		for _, word := range words {
+			if len(word) < 3 || len(word) > 8 {
+				t.Errorf("Word %q has invalid length %d (should be 3-8)", word, len(word))
+			}
+			if !isAlphaOnly(word) {
+				t.Errorf("Word %q is not alpha-only", word)
+			}
+		}
+	})
+
+	t.Run("NonexistentFile", func(t *testing.T) {
+		_, err := readWordList("/nonexistent/path/words")
+		if err == nil {
+			t.Error("Expected error for nonexistent file, got nil")
+		}
+	})
+
+	t.Run("EmptyFile", func(t *testing.T) {
+		tempFile := filepath.Join(t.TempDir(), "empty")
+		err := os.WriteFile(tempFile, []byte(""), 0644)
+		if err != nil {
+			t.Fatalf("Failed to create empty file: %v", err)
+		}
+
+		_, err = readWordList(tempFile)
+		if err == nil {
+			t.Error("Expected error for empty word list, got nil")
+		}
+	})
+
+	t.Run("NoValidWords", func(t *testing.T) {
+		tempFile := filepath.Join(t.TempDir(), "invalid")
+		content := "ab\nverylongwordthatshouldbeskipped\ntest123\n@#$%\n"
+		err := os.WriteFile(tempFile, []byte(content), 0644)
+		if err != nil {
+			t.Fatalf("Failed to create test file: %v", err)
+		}
+
+		_, err = readWordList(tempFile)
+		if err == nil {
+			t.Error("Expected error for no valid words, got nil")
+		}
+	})
+}
+
+func TestLoadSystemWords(t *testing.T) {
+	t.Run("LoadSystemWords", func(t *testing.T) {
+		// This test checks if system words can be loaded
+		// It may pass or fail depending on the system, but shouldn't crash
+		words, err := loadSystemWords()
+		
+		if err != nil {
+			// It's OK if no system word list is found
+			t.Logf("No system word list found (this is OK): %v", err)
+			return
+		}
+
+		// If we found system words, verify they meet our criteria
+		if len(words) == 0 {
+			t.Error("System words loaded but empty list returned")
+		}
+
+		// Check a sample of words to ensure they're valid
+		sampleSize := 10
+		if len(words) < sampleSize {
+			sampleSize = len(words)
+		}
+
+		for i := 0; i < sampleSize; i++ {
+			word := words[i]
+			if len(word) < 3 || len(word) > 8 {
+				t.Errorf("System word %q has invalid length %d", word, len(word))
+			}
+			if !isAlphaOnly(word) {
+				t.Errorf("System word %q is not alpha-only", word)
+			}
+		}
+
+		t.Logf("Successfully loaded %d system words", len(words))
+	})
+}
+
+func TestGenerateRandomSessionName(t *testing.T) {
+	t.Run("GenerateRandomSessionName", func(t *testing.T) {
+		// Generate multiple session names to test
+		names := make(map[string]bool)
+		for i := 0; i < 5; i++ {
+			name := generateRandomSessionName()
+			
+			// Check basic format: word1-word2-MMDD-HHMM
+			parts := fmt.Sprintf("%s", name)
+			if parts == "" {
+				t.Error("Generated empty session name")
+			}
+
+			// Session name should be unique each time (with high probability)
+			if names[name] {
+				t.Errorf("Generated duplicate session name: %s", name)
+			}
+			names[name] = true
+
+			t.Logf("Generated session name: %s", name)
+
+			// Verify format has at least 3 parts (word1-word2-timestamp)
+			hyphenCount := 0
+			for _, char := range name {
+				if char == '-' {
+					hyphenCount++
+				}
+			}
+			if hyphenCount < 2 {
+				t.Errorf("Session name %q should have at least 2 hyphens", name)
+			}
+
+			// Session name should be reasonable length
+			if len(name) < 10 || len(name) > 50 {
+				t.Errorf("Session name %q has unusual length %d", name, len(name))
+			}
+		}
+	})
+
+	t.Run("SessionNameUniqueness", func(t *testing.T) {
+		// Generate many names quickly to test uniqueness
+		names := make(map[string]bool)
+		duplicates := 0
+		
+		for i := 0; i < 100; i++ {
+			name := generateRandomSessionName()
+			if names[name] {
+				duplicates++
+			}
+			names[name] = true
+			
+			// Small delay to ensure different timestamps
+			time.Sleep(time.Millisecond)
+		}
+
+		// Some duplicates might occur due to timestamp granularity, but should be rare
+		if duplicates > 5 {
+			t.Errorf("Too many duplicate session names: %d out of 100", duplicates)
+		}
+
+		t.Logf("Generated 100 session names with %d duplicates", duplicates)
+	})
+}
+
+func TestSessionNameIntegration(t *testing.T) {
+	t.Run("SessionNameGeneration", func(t *testing.T) {
+		// Test that session creation with auto-generated names works
+		tempDir := t.TempDir()
+		registry := &SessionRegistry{basePath: tempDir}
+		
+		// Test with explicit session name
+		explicitName := "my-test-session"
+		err := registry.createSession(explicitName, "echo test", 12345)
+		if err != nil {
+			t.Fatalf("Failed to create session with explicit name: %v", err)
+		}
+		
+		// Test with auto-generated session name
+		autoName := generateRandomSessionName()
+		err = registry.createSession(autoName, "echo test", 12346)
+		if err != nil {
+			t.Fatalf("Failed to create session with auto-generated name: %v", err)
+		}
+		
+		// Verify both sessions exist
+		sessions, err := registry.listSessions()
+		if err != nil {
+			t.Fatalf("Failed to list sessions: %v", err)
+		}
+		
+		if len(sessions) != 2 {
+			t.Fatalf("Expected 2 sessions, got %d", len(sessions))
+		}
+		
+		// Find the sessions by name
+		foundExplicit := false
+		foundAuto := false
+		for _, session := range sessions {
+			if session.Name == explicitName {
+				foundExplicit = true
+			}
+			if session.Name == autoName {
+				foundAuto = true
+			}
+		}
+		
+		if !foundExplicit {
+			t.Errorf("Explicit session %q not found", explicitName)
+		}
+		if !foundAuto {
+			t.Errorf("Auto-generated session %q not found", autoName)
+		}
+		
+		t.Logf("Successfully created sessions: %q and %q", explicitName, autoName)
+	})
+	
+	t.Run("SessionNameValidation", func(t *testing.T) {
+		// Test that empty session names are handled
+		tempDir := t.TempDir()
+		registry := &SessionRegistry{basePath: tempDir}
+		
+		err := registry.createSession("", "echo test", 12345)
+		if err == nil {
+			t.Error("Expected error for empty session name, got nil")
+		}
+	})
+}
