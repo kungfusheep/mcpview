@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -600,6 +601,17 @@ func NewStdioProxyWithSession(targetCmd, sessionName string) *StdioProxy {
 		targetCmd:   targetCmd,
 		messageLog:  make([]LoggedMessage, 0),
 		sessionName: sessionName,
+		sessionsDir: "/tmp/mcpview-sessions", // Default
+	}
+}
+
+// NewStdioProxyWithSessionAndDir creates a new stdio proxy with session support and custom directory
+func NewStdioProxyWithSessionAndDir(targetCmd, sessionName, sessionsDir string) *StdioProxy {
+	return &StdioProxy{
+		targetCmd:   targetCmd,
+		messageLog:  make([]LoggedMessage, 0),
+		sessionName: sessionName,
+		sessionsDir: sessionsDir,
 	}
 }
 
@@ -663,7 +675,7 @@ func (sp *StdioProxy) Start() error {
 	
 	// Create session metadata if session name is provided
 	if sp.sessionName != "" {
-		registry := NewSessionRegistry()
+		registry := NewSessionRegistryWithPath(sp.sessionsDir)
 		if err := registry.createSession(sp.sessionName, sp.targetCmd, sp.targetProc.Process.Pid); err != nil {
 			// Log error but don't fail the proxy - session is optional
 			fmt.Fprintf(os.Stderr, "Warning: Failed to create session metadata: %v\n", err)
@@ -723,6 +735,16 @@ func (sp *StdioProxy) Stop() error {
 	if sp.targetStdout != nil {
 		sp.targetStdout.Close()
 	}
+	
+	// Clean up session if this was a named session
+	if sp.sessionName != "" {
+		registry := NewSessionRegistryWithPath(sp.sessionsDir)
+		if err := registry.removeSession(sp.sessionName); err != nil {
+			// Log error but don't fail the stop operation
+			fmt.Fprintf(os.Stderr, "Warning: Failed to cleanup session %s: %v\n", sp.sessionName, err)
+		}
+	}
+	
 	if sp.targetProc != nil {
 		return sp.targetProc.Wait()
 	}
@@ -742,6 +764,12 @@ func NewSessionRegistry() *SessionRegistry {
 	}
 }
 
+func NewSessionRegistryWithPath(basePath string) *SessionRegistry {
+	return &SessionRegistry{
+		basePath: basePath,
+	}
+}
+
 func (sr *SessionRegistry) createSessionDir(name string) error {
 	sessionDir := sr.getSessionDir(name)
 	return os.MkdirAll(sessionDir, 0755)
@@ -756,6 +784,10 @@ func (sr *SessionRegistry) getMetadataPath(name string) string {
 }
 
 func (sr *SessionRegistry) createSession(name, targetCmd string, pid int) error {
+	if name == "" {
+		return fmt.Errorf("session name cannot be empty")
+	}
+	
 	if err := sr.createSessionDir(name); err != nil {
 		return fmt.Errorf("failed to create session directory: %v", err)
 	}
@@ -781,6 +813,95 @@ func (sr *SessionRegistry) createSession(name, targetCmd string, pid int) error 
 	}
 
 	return nil
+}
+
+func (sr *SessionRegistry) listSessions() ([]ProxySession, error) {
+	if _, err := os.Stat(sr.basePath); os.IsNotExist(err) {
+		return []ProxySession{}, nil // No sessions directory yet
+	}
+
+	entries, err := os.ReadDir(sr.basePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read sessions directory: %v", err)
+	}
+
+	var sessions []ProxySession
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		sessionName := entry.Name()
+		session, err := sr.loadSession(sessionName)
+		if err != nil {
+			// Skip invalid sessions but don't fail the whole operation
+			continue
+		}
+
+		sessions = append(sessions, *session)
+	}
+
+	return sessions, nil
+}
+
+func (sr *SessionRegistry) loadSession(name string) (*ProxySession, error) {
+	metadataPath := sr.getMetadataPath(name)
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read session metadata: %v", err)
+	}
+
+	var session ProxySession
+	if err := json.Unmarshal(data, &session); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal session metadata: %v", err)
+	}
+
+	return &session, nil
+}
+
+func (sr *SessionRegistry) isProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	
+	// Check if process exists by sending signal 0
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	
+	// On Unix systems, signal 0 can be used to check if a process exists
+	// We need to import syscall for this to work properly
+	err = process.Signal(syscall.Signal(0))
+	return err == nil
+}
+
+func (sr *SessionRegistry) cleanupDeadSessions() error {
+	sessions, err := sr.listSessions()
+	if err != nil {
+		return fmt.Errorf("failed to list sessions for cleanup: %v", err)
+	}
+
+	var cleanupErrors []string
+	for _, session := range sessions {
+		if !sr.isProcessAlive(session.PID) {
+			sessionDir := sr.getSessionDir(session.Name)
+			if err := os.RemoveAll(sessionDir); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("failed to remove session %s: %v", session.Name, err))
+			}
+		}
+	}
+
+	if len(cleanupErrors) > 0 {
+		return fmt.Errorf("cleanup errors: %s", strings.Join(cleanupErrors, "; "))
+	}
+
+	return nil
+}
+
+func (sr *SessionRegistry) removeSession(name string) error {
+	sessionDir := sr.getSessionDir(name)
+	return os.RemoveAll(sessionDir)
 }
 
 // Debug mode layout
@@ -814,6 +935,7 @@ type StdioProxy struct {
 	mutex        sync.RWMutex
 	running      bool
 	sessionName  string // Session name for proxy sessions
+	sessionsDir  string // Directory for session metadata
 }
 
 // Session management structures
@@ -1869,6 +1991,8 @@ func main() {
 	proxyMode := flag.Bool("proxy", false, "Start in stdio proxy mode")
 	targetCmd := flag.String("target", "", "Target MCP server command for proxy mode")
 	sessionName := flag.String("session", "", "Session name for proxy mode")
+	listSessions := flag.Bool("list-sessions", false, "List active proxy sessions and exit")
+	sessionsDir := flag.String("sessions-dir", "/tmp/mcpview-sessions", "Directory to store session metadata")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "MCP Explorer - A comprehensive terminal UI for debugging and developing with MCP servers\n\n")
@@ -1881,8 +2005,48 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s --debug --server \"node server.js\" # Debug mode with auto-connect\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --proxy --target \"python srv.py\" # Stdio proxy mode\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --proxy --target \"python srv.py\" --session \"myapi\" # Named proxy session\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --sessions-dir ./sessions --list-sessions # Use local sessions directory\n", os.Args[0])
 	}
 	flag.Parse()
+	
+	// Handle session listing
+	if *listSessions {
+		registry := NewSessionRegistryWithPath(*sessionsDir)
+		
+		// Clean up dead sessions first
+		if err := registry.cleanupDeadSessions(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to cleanup dead sessions: %v\n", err)
+		}
+		
+		// List remaining sessions
+		sessions, err := registry.listSessions()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error listing sessions: %v\n", err)
+			os.Exit(1)
+		}
+		
+		if len(sessions) == 0 {
+			fmt.Println("No active proxy sessions")
+		} else {
+			fmt.Printf("Active proxy sessions (%d):\n", len(sessions))
+			for _, session := range sessions {
+				alive := "✓"
+				if !registry.isProcessAlive(session.PID) {
+					alive = "✗"
+				}
+				duration := time.Since(session.StartTime).Truncate(time.Second)
+				lastSeen := time.Since(session.LastActivity).Truncate(time.Second)
+				fmt.Printf("  %s %s\n", alive, session.Name)
+				fmt.Printf("    Command: %s\n", session.TargetCmd)
+				fmt.Printf("    PID: %d\n", session.PID)
+				fmt.Printf("    Running: %v\n", duration)
+				fmt.Printf("    Last activity: %v ago\n", lastSeen)
+				fmt.Printf("    Messages: %d\n", session.MessageCount)
+				fmt.Println()
+			}
+		}
+		return
+	}
 	
 	// Validate proxy mode arguments
 	if *proxyMode && *targetCmd == "" {
@@ -1899,7 +2063,7 @@ func main() {
 	if *proxyMode {
 		var proxy *StdioProxy
 		if *sessionName != "" {
-			proxy = NewStdioProxyWithSession(*targetCmd, *sessionName)
+			proxy = NewStdioProxyWithSessionAndDir(*targetCmd, *sessionName, *sessionsDir)
 		} else {
 			proxy = NewStdioProxy(*targetCmd)
 		}
