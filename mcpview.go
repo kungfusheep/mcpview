@@ -54,17 +54,15 @@ func readWordList(path string) ([]string, error) {
 	}
 	defer file.Close()
 
-	var words []string
+	var allWords []string
 	scanner := bufio.NewScanner(file)
 
+	// First pass: collect all suitable words
 	for scanner.Scan() {
 		word := strings.ToLower(strings.TrimSpace(scanner.Text()))
 		// Filter for good session name words (3-8 chars, letters only)
 		if len(word) >= 3 && len(word) <= 8 && isAlphaOnly(word) {
-			words = append(words, word)
-			if len(words) >= 1000 { // Limit to first 1000 suitable words for performance
-				break
-			}
+			allWords = append(allWords, word)
 		}
 	}
 
@@ -72,8 +70,23 @@ func readWordList(path string) ([]string, error) {
 		return nil, err
 	}
 
-	if len(words) == 0 {
+	if len(allWords) == 0 {
 		return nil, fmt.Errorf("no suitable words found")
+	}
+
+	// If we have more than 1000 words, sample evenly across the list
+	var words []string
+	if len(allWords) <= 1000 {
+		words = allWords
+	} else {
+		// Sample every Nth word to get approximately 1000 words from across the alphabet
+		step := len(allWords) / 1000
+		for i := 0; i < len(allWords); i += step {
+			words = append(words, allWords[i])
+			if len(words) >= 1000 {
+				break
+			}
+		}
 	}
 
 	return words, nil

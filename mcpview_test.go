@@ -709,6 +709,51 @@ func TestGenerateRandomSessionName(t *testing.T) {
 		}
 	})
 
+	t.Run("WordDistribution", func(t *testing.T) {
+		// Test that we get words from across the alphabet, not just 'a' words
+		words, err := loadSystemWords()
+		if err != nil {
+			t.Skipf("Skipping word distribution test: %v", err)
+			return
+		}
+
+		// Count words by first letter
+		letterCounts := make(map[rune]int)
+		for _, word := range words {
+			if len(word) > 0 {
+				firstLetter := rune(word[0])
+				letterCounts[firstLetter]++
+			}
+		}
+
+		// We should have words starting with multiple letters
+		if len(letterCounts) < 5 {
+			t.Errorf("Expected words from multiple letters, only got %d different starting letters", len(letterCounts))
+		}
+
+		// We shouldn't have more than 50% of words starting with 'a'
+		aCount := letterCounts['a']
+		totalWords := len(words)
+		aPercentage := float64(aCount) / float64(totalWords) * 100
+
+		if aPercentage > 50 {
+			t.Errorf("Too many words start with 'a': %.1f%% (%d/%d)", aPercentage, aCount, totalWords)
+		}
+
+		t.Logf("Word distribution: %d words across %d letters (%.1f%% start with 'a')", 
+			totalWords, len(letterCounts), aPercentage)
+
+		// Log first few letters for debugging
+		var letters []string
+		for letter := range letterCounts {
+			letters = append(letters, string(letter))
+		}
+		if len(letters) > 10 {
+			letters = letters[:10]
+		}
+		t.Logf("Sample starting letters: %v", letters)
+	})
+
 	t.Run("SessionNameUniqueness", func(t *testing.T) {
 		// Generate many names quickly to test uniqueness
 		names := make(map[string]bool)
