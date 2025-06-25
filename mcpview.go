@@ -101,6 +101,7 @@ const (
 	StateResourcesList
 	StateMessageHistory
 	StateDebugMode
+	StateSessionList
 )
 
 // JSON Schema structures for parsing tool input schemas
@@ -1117,6 +1118,9 @@ type Model struct {
 	toolResponses     []ToolResponse
 	currentResponse   *ToolResponse
 	selectedResponse  int // For navigating through response history
+	sessions          []ProxySession // Available proxy sessions
+	selectedSession   int            // Currently selected session in session list
+	sessionsDir       string         // Directory for session metadata
 }
 
 // Tool execution state
@@ -1217,6 +1221,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateMessageHistory(msg)
 		case StateDebugMode:
 			return m.updateDebugMode(msg)
+		case StateSessionList:
+			return m.updateSessionList(msg)
 		}
 
 	case ConnectedMsg:
@@ -1549,6 +1555,48 @@ func (m Model) updateDebugMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.debugLayout.messagePaneHeight = int(float64(m.height) * m.debugLayout.splitRatio)
 			m.debugLayout.mainPaneHeight = m.height - m.debugLayout.messagePaneHeight
 		}
+	}
+	return m, nil
+}
+
+func (m Model) updateSessionList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "up", "k":
+		if m.selectedSession > 0 {
+			m.selectedSession--
+		}
+	case "down", "j":
+		if m.selectedSession < len(m.sessions)-1 {
+			m.selectedSession++
+		}
+	case "enter":
+		// TODO: Connect to selected session (Phase 5)
+		if len(m.sessions) > 0 {
+			// For now, just show a message that this will be implemented
+			m.error = fmt.Sprintf("Attaching to session '%s' will be implemented in Phase 5", m.sessions[m.selectedSession].Name)
+		}
+	case "r":
+		// Refresh session list
+		registry := NewSessionRegistryWithPath(m.sessionsDir)
+		if err := registry.cleanupDeadSessions(); err != nil {
+			m.error = fmt.Sprintf("Failed to cleanup dead sessions: %v", err)
+			return m, nil
+		}
+		
+		sessions, err := registry.listSessions()
+		if err != nil {
+			m.error = fmt.Sprintf("Failed to load sessions: %v", err)
+			return m, nil
+		}
+		
+		m.sessions = sessions
+		// Adjust selection if it's out of bounds
+		if m.selectedSession >= len(m.sessions) {
+			m.selectedSession = max(0, len(m.sessions)-1)
+		}
+		m.error = "" // Clear any previous errors
 	}
 	return m, nil
 }
@@ -2118,6 +2166,63 @@ func (m Model) View() string {
 			s += "\n" + styles.error.Render("Error: "+m.error)
 		}
 		return s
+
+	case StateSessionList:
+		s := styles.title.Render("Active MCP Proxy Sessions")
+		s += "\n" + styles.header.Render("Select a session to attach and inspect:")
+		
+		if m.loading {
+			s += "\n" + styles.loading.Render("Loading sessions...")
+		} else if len(m.sessions) == 0 {
+			s += "\n\n" + styles.normal.Render("No active proxy sessions found.")
+			s += "\n" + styles.normal.Copy().Faint(true).Render("Start a proxy session with: mcpview --proxy --session <name> --target \"<command>\"")
+		} else {
+			s += "\n\nSessions:"
+			for i, session := range m.sessions {
+				style := styles.normal
+				if i == m.selectedSession {
+					style = styles.selected
+				}
+				
+				// Status indicator
+				statusIcon := "●"
+				statusColor := "2" // Green for alive
+				if !NewSessionRegistryWithPath(m.sessionsDir).isProcessAlive(session.PID) {
+					statusIcon = "○"
+					statusColor = "1" // Red for dead
+				}
+				statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor))
+				
+				// Format session info
+				duration := time.Since(session.StartTime).Truncate(time.Second)
+				sessionLine := fmt.Sprintf("  %s %s", statusIcon, session.Name)
+				sessionLine += fmt.Sprintf(" | %s | %s", session.TargetCmd, duration)
+				if session.MessageCount > 0 {
+					sessionLine += fmt.Sprintf(" | %d msgs", session.MessageCount)
+				}
+				
+				s += "\n" + style.Render(sessionLine)
+				
+				// Show additional details for selected session
+				if i == m.selectedSession {
+					details := fmt.Sprintf("    PID: %d | Started: %s", 
+						session.PID, 
+						session.StartTime.Format("15:04:05"))
+					if !session.LastActivity.IsZero() {
+						details += fmt.Sprintf(" | Last activity: %s", 
+							session.LastActivity.Format("15:04:05"))
+					}
+					s += "\n" + statusStyle.Render(details)
+				}
+			}
+		}
+		
+		s += "\n\n" + "↑/↓ navigate, Enter attach (Phase 5), R refresh, Q quit"
+		
+		if m.error != "" {
+			s += "\n" + styles.error.Render("Error: "+m.error)
+		}
+		return s
 	}
 
 	return "Unknown state"
@@ -2132,6 +2237,7 @@ func main() {
 	sessionName := flag.String("session", "", "Session name for proxy mode")
 	listSessions := flag.Bool("list-sessions", false, "List active proxy sessions and exit")
 	sessionsDir := flag.String("sessions-dir", "/tmp/mcpview-sessions", "Directory to store session metadata")
+	attachMode := flag.Bool("attach", false, "Show session list for attaching to running sessions")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "MCP Explorer - A comprehensive terminal UI for debugging and developing with MCP servers\n\n")
@@ -2145,6 +2251,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s --proxy --target \"python srv.py\" # Stdio proxy mode\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --proxy --target \"python srv.py\" --session \"myapi\" # Named proxy session\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --sessions-dir ./sessions --list-sessions # Use local sessions directory\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --attach # Show interactive session list for debugging\n", os.Args[0])
 	}
 	flag.Parse()
 	
@@ -2183,6 +2290,43 @@ func main() {
 				fmt.Printf("    Messages: %d\n", session.MessageCount)
 				fmt.Println()
 			}
+		}
+		return
+	}
+	
+	// Handle attach mode - start TUI with session list
+	if *attachMode {
+		model := NewModel()
+		model.state = StateSessionList
+		model.sessionsDir = *sessionsDir
+		
+		// Load initial sessions
+		registry := NewSessionRegistryWithPath(*sessionsDir)
+		if err := registry.cleanupDeadSessions(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to cleanup dead sessions: %v\n", err)
+		}
+		
+		sessions, err := registry.listSessions()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading sessions: %v\n", err)
+			os.Exit(1)
+		}
+		
+		model.sessions = sessions
+		model.selectedSession = 0
+		
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		
+		p := tea.NewProgram(&model, tea.WithAltScreen())
+		
+		go func() {
+			<-ctx.Done()
+			p.Quit()
+		}()
+		
+		if _, err := p.Run(); err != nil {
+			log.Fatal(err)
 		}
 		return
 	}
