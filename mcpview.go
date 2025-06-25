@@ -102,6 +102,7 @@ const (
 	StateMessageHistory
 	StateDebugMode
 	StateSessionList
+	StateSessionViewer
 )
 
 // JSON Schema structures for parsing tool input schemas
@@ -1121,6 +1122,10 @@ type Model struct {
 	sessions          []ProxySession // Available proxy sessions
 	selectedSession   int            // Currently selected session in session list
 	sessionsDir       string         // Directory for session metadata
+	attachedSession   *ProxySession  // Currently attached session for viewing
+	sessionSocket     net.Conn       // Connection to attached session's Unix socket
+	sessionMessages   []LoggedMessage // Live messages from attached session
+	sessionScroll     int            // Scroll position for session messages
 }
 
 // Tool execution state
@@ -1153,6 +1158,8 @@ type ErrorMsg struct{ err error }
 type MessageLoggedMsg struct{ message LoggedMessage }
 type ToolResponseMsg struct{ response ToolResponse }
 type ToolExecutionStartMsg struct{}
+type SessionAttachedMsg struct{ Session ProxySession; Socket net.Conn }
+type SessionMessageMsg struct{ message LoggedMessage }
 
 func NewModel() Model {
 	client := NewMCPClient()
@@ -1223,6 +1230,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateDebugMode(msg)
 		case StateSessionList:
 			return m.updateSessionList(msg)
+		case StateSessionViewer:
+			return m.updateSessionViewer(msg)
 		}
 
 	case ConnectedMsg:
@@ -1267,6 +1276,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.error = "" // Clear any previous errors
 		return m, nil
+
+	case SessionAttachedMsg:
+		// Successfully attached to session
+		m.attachedSession = &msg.Session
+		m.sessionSocket = msg.Socket
+		m.sessionMessages = []LoggedMessage{} // Clear previous messages
+		m.sessionScroll = 0
+		m.state = StateSessionViewer
+		m.error = "" // Clear any previous errors
+		// Start listening for messages from the session
+		return m, m.listenToSession()
+
+	case SessionMessageMsg:
+		// New message received from attached session
+		m.sessionMessages = append(m.sessionMessages, msg.message)
+		// Auto-scroll to bottom (latest message)
+		if len(m.sessionMessages) > 20 { // Keep last 100 messages for performance
+			m.sessionMessages = m.sessionMessages[1:]
+		}
+		return m, m.listenToSession() // Continue listening
 
 	case ErrorMsg:
 		m.error = msg.err.Error()
@@ -1572,10 +1601,9 @@ func (m Model) updateSessionList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.selectedSession++
 		}
 	case "enter":
-		// TODO: Connect to selected session (Phase 5)
+		// Attach to selected session
 		if len(m.sessions) > 0 {
-			// For now, just show a message that this will be implemented
-			m.error = fmt.Sprintf("Attaching to session '%s' will be implemented in Phase 5", m.sessions[m.selectedSession].Name)
+			return m, m.attachToSession(m.sessions[m.selectedSession])
 		}
 	case "r":
 		// Refresh session list
@@ -1599,6 +1627,97 @@ func (m Model) updateSessionList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.error = "" // Clear any previous errors
 	}
 	return m, nil
+}
+
+func (m Model) updateSessionViewer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q":
+		// Close socket connection before quitting
+		if m.sessionSocket != nil {
+			m.sessionSocket.Close()
+		}
+		return m, tea.Quit
+	case "esc":
+		// Detach from session and return to session list
+		if m.sessionSocket != nil {
+			m.sessionSocket.Close()
+			m.sessionSocket = nil
+		}
+		m.attachedSession = nil
+		m.sessionMessages = []LoggedMessage{}
+		m.state = StateSessionList
+		// Refresh session list when returning
+		registry := NewSessionRegistryWithPath(m.sessionsDir)
+		if err := registry.cleanupDeadSessions(); err == nil {
+			if sessions, err := registry.listSessions(); err == nil {
+				m.sessions = sessions
+			}
+		}
+	case "up", "k":
+		// Scroll up in messages
+		if m.sessionScroll > 0 {
+			m.sessionScroll--
+		}
+	case "down", "j":
+		// Scroll down in messages
+		maxScroll := max(0, len(m.sessionMessages)-20) // Visible area
+		if m.sessionScroll < maxScroll {
+			m.sessionScroll++
+		}
+	case "g":
+		// Go to top
+		m.sessionScroll = 0
+	case "G":
+		// Go to bottom (latest messages)
+		m.sessionScroll = max(0, len(m.sessionMessages)-20)
+	}
+	return m, nil
+}
+
+func (m Model) listenToSession() tea.Cmd {
+	if m.sessionSocket == nil {
+		return nil
+	}
+	
+	return func() tea.Msg {
+		// Read from socket with timeout
+		buf := make([]byte, 4096)
+		n, err := m.sessionSocket.Read(buf)
+		if err != nil {
+			return ErrorMsg{fmt.Errorf("session disconnected: %v", err)}
+		}
+		
+		// Parse the received data as a logged message
+		var loggedMsg LoggedMessage
+		if err := json.Unmarshal(buf[:n], &loggedMsg); err != nil {
+			// If JSON parsing fails, create a raw message
+			loggedMsg = LoggedMessage{
+				Content:   buf[:n],
+				Timestamp: time.Now(),
+				Direction: DirectionInbound, // Messages from proxy are inbound to us
+			}
+		}
+		
+		return SessionMessageMsg{message: loggedMsg}
+	}
+}
+
+func (m Model) attachToSession(session ProxySession) tea.Cmd {
+	return func() tea.Msg {
+		// Check if session is still alive
+		registry := NewSessionRegistryWithPath(m.sessionsDir)
+		if !registry.isProcessAlive(session.PID) {
+			return ErrorMsg{fmt.Errorf("session '%s' is no longer active", session.Name)}
+		}
+		
+		// Connect to the session's Unix socket
+		conn, err := net.Dial("unix", session.SocketPath)
+		if err != nil {
+			return ErrorMsg{fmt.Errorf("failed to connect to session socket: %v", err)}
+		}
+		
+		return SessionAttachedMsg{Session: session, Socket: conn}
+	}
 }
 
 func (m Model) connect() tea.Cmd {
@@ -2217,7 +2336,83 @@ func (m Model) View() string {
 			}
 		}
 		
-		s += "\n\n" + "↑/↓ navigate, Enter attach (Phase 5), R refresh, Q quit"
+		s += "\n\n" + "↑/↓ navigate, Enter attach, R refresh, Q quit"
+		
+		if m.error != "" {
+			s += "\n" + styles.error.Render("Error: "+m.error)
+		}
+		return s
+
+	case StateSessionViewer:
+		if m.attachedSession == nil {
+			return "No session attached"
+		}
+		
+		s := styles.title.Render(fmt.Sprintf("Session Viewer: %s", m.attachedSession.Name))
+		s += "\n" + styles.header.Render(fmt.Sprintf("Target: %s | PID: %d", m.attachedSession.TargetCmd, m.attachedSession.PID))
+		
+		// Status indicator
+		registry := NewSessionRegistryWithPath(m.sessionsDir)
+		statusIcon := "●"
+		statusColor := "2" // Green
+		if !registry.isProcessAlive(m.attachedSession.PID) {
+			statusIcon = "○"
+			statusColor = "1" // Red
+		}
+		statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor))
+		s += "\n" + statusStyle.Render(fmt.Sprintf("%s Session Status: %s", statusIcon, 
+			map[bool]string{true: "Active", false: "Disconnected"}[registry.isProcessAlive(m.attachedSession.PID)]))
+		
+		s += "\n" + strings.Repeat("─", m.width)
+		
+		// Live messages
+		s += "\n" + styles.header.Render(fmt.Sprintf("Live Messages (%d total):", len(m.sessionMessages)))
+		
+		if len(m.sessionMessages) == 0 {
+			s += "\n" + styles.normal.Render("No messages yet... waiting for MCP communication")
+		} else {
+			// Show scrollable messages
+			visibleLines := m.height - 8 // Reserve space for header and controls
+			startIdx := m.sessionScroll
+			endIdx := min(startIdx+visibleLines, len(m.sessionMessages))
+			
+			for i := startIdx; i < endIdx; i++ {
+				msg := m.sessionMessages[i]
+				
+				// Direction and timestamp
+				direction := "→"
+				color := "blue"
+				if msg.Direction == DirectionInbound {
+					direction = "←"
+					color = "green"
+				}
+				
+				timestamp := msg.Timestamp.Format("15:04:05.000")
+				msgStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+				
+				// Show message content (truncated for display)
+				content := string(msg.Content)
+				if len(content) > 100 {
+					content = content[:97] + "..."
+				}
+				
+				s += "\n" + msgStyle.Render(fmt.Sprintf("%s %s %s", direction, timestamp, content))
+			}
+			
+			// Show scroll indicators
+			if startIdx > 0 || endIdx < len(m.sessionMessages) {
+				scrollInfo := fmt.Sprintf("[%d-%d/%d]", startIdx+1, endIdx, len(m.sessionMessages))
+				if startIdx > 0 {
+					scrollInfo = "↑ " + scrollInfo
+				}
+				if endIdx < len(m.sessionMessages) {
+					scrollInfo += " ↓"
+				}
+				s += "\n" + styles.normal.Copy().Faint(true).Render(scrollInfo)
+			}
+		}
+		
+		s += "\n\n" + "↑/↓ scroll messages, G top, Shift+G bottom, Esc detach, Q quit"
 		
 		if m.error != "" {
 			s += "\n" + styles.error.Render("Error: "+m.error)
