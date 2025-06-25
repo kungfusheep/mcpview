@@ -3,6 +3,9 @@
 **A terminal UI for developing, debugging, and testing MCP (Model Context Protocol) servers.**
 
 Session-based proxy debugging • Live message monitoring • Tool testing with dynamic forms • Message persistence
+![Convert to GIF June 25 2025 (2)](https://github.com/user-attachments/assets/4cf083fa-e422-4da5-90eb-7fc6a1a7cc48)
+
+
 
 ## Features
 
@@ -56,6 +59,9 @@ mcpview --list-sessions            # Lists all active sessions
 # 3. Configure your MCP client to connect through the proxy
 # Replace "python server.py" with "mcpview --proxy --target 'python server.py'"
 ```
+
+![Convert to GIF Project June 25 2025](https://github.com/user-attachments/assets/bf4583d1-290f-4da0-a37f-b3177121a104)
+
 
 **Custom Session Management:**
 ```bash
