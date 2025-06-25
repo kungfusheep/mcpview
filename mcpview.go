@@ -590,6 +590,31 @@ func (m *Model) calculateToolLayout(tool Tool) {
 	}
 }
 
+func (m *Model) calculateSessionLayout() {
+	// Session info is fixed height (5 lines)
+	m.sessionLayout.infoHeight = 5
+	
+	// Calculate available height for messages and detail
+	availableHeight := m.sessionLayout.totalHeight - m.sessionLayout.infoHeight - 4 // Reserve space for instructions
+	if availableHeight < 6 {
+		availableHeight = 6
+	}
+	
+	// Split available height between messages and detail based on ratio
+	m.sessionLayout.messageHeight = int(float64(availableHeight) * m.sessionLayout.messageRatio)
+	m.sessionLayout.detailHeight = availableHeight - m.sessionLayout.messageHeight
+	
+	// Ensure minimum heights
+	if m.sessionLayout.messageHeight < 5 {
+		m.sessionLayout.messageHeight = 5
+		m.sessionLayout.detailHeight = availableHeight - 5
+	}
+	if m.sessionLayout.detailHeight < 5 {
+		m.sessionLayout.detailHeight = 5
+		m.sessionLayout.messageHeight = availableHeight - 5
+	}
+}
+
 // NewStdioProxy creates a new stdio proxy
 func NewStdioProxy(targetCmd string) *StdioProxy {
 	return &StdioProxy{
@@ -1061,6 +1086,17 @@ type ToolLayout struct {
 	totalHeight    int     // Total available height
 }
 
+// Session viewer layout with three panes
+type SessionLayout struct {
+	infoHeight      int     // Top pane: session info (fixed)
+	messageHeight   int     // Middle pane: message list
+	detailHeight    int     // Bottom pane: message detail
+	messageScroll   int     // Scroll position for messages
+	detailScroll    int     // Scroll position for detail
+	messageRatio    float64 // 0.2 to 0.8, portion for messages vs detail
+	totalHeight     int     // Total available height
+}
+
 // Stdio Proxy manages MCP stdio proxy functionality
 type StdioProxy struct {
 	targetCmd      string
@@ -1126,6 +1162,8 @@ type Model struct {
 	sessionSocket     net.Conn       // Connection to attached session's Unix socket
 	sessionMessages   []LoggedMessage // Live messages from attached session
 	sessionScroll     int            // Scroll position for session messages
+	selectedSessionMessage int        // Currently selected message in session viewer
+	sessionLayout     SessionLayout  // Layout for session viewer panes
 }
 
 // Tool execution state
@@ -1212,6 +1250,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.toolLayout.totalHeight = m.height
 			m.calculateToolLayout(m.tools[m.selectedTool])
 		}
+		// Recalculate session layout if in session viewer mode
+		if m.state == StateSessionViewer {
+			m.sessionLayout.totalHeight = m.height
+			m.calculateSessionLayout()
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -1281,8 +1324,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Successfully attached to session
 		m.attachedSession = &msg.Session
 		m.sessionSocket = msg.Socket
-		m.sessionMessages = []LoggedMessage{} // Clear previous messages
-		m.sessionScroll = 0
+		// Keep existing messages if reconnecting to same session, otherwise clear
+		if m.attachedSession == nil || m.attachedSession.Name != msg.Session.Name {
+			m.sessionMessages = []LoggedMessage{}
+		}
+		// Initialize selection to show latest message
+		m.selectedSessionMessage = max(0, len(m.sessionMessages)-1) // Select latest message
+		
+		// Initialize session layout
+		m.sessionLayout = SessionLayout{
+			totalHeight:   m.height,
+			infoHeight:    5, // Fixed height for session info
+			messageRatio:  0.5, // 50/50 split between messages and detail
+			messageScroll: 0,
+			detailScroll:  0,
+		}
+		m.calculateSessionLayout()
+		
 		m.state = StateSessionViewer
 		m.error = "" // Clear any previous errors
 		// Start listening for messages from the session
@@ -1291,10 +1349,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case SessionMessageMsg:
 		// New message received from attached session
 		m.sessionMessages = append(m.sessionMessages, msg.message)
-		// Auto-scroll to bottom (latest message)
-		if len(m.sessionMessages) > 20 { // Keep last 100 messages for performance
+		
+		// Auto-follow latest messages (but allow user to scroll up to pause auto-follow)
+		atBottom := m.selectedSessionMessage >= max(0, len(m.sessionMessages)-2) // Within 1 message of bottom
+		
+		if len(m.sessionMessages) > 100 { // Keep last 100 messages for performance
 			m.sessionMessages = m.sessionMessages[1:]
+			// Adjust scroll and selection if they're out of bounds
+			if m.sessionLayout.messageScroll > 0 {
+				m.sessionLayout.messageScroll--
+			}
+			if m.selectedSessionMessage > 0 {
+				m.selectedSessionMessage--
+			}
 		}
+		
+		// If user was at bottom, auto-follow new message
+		if atBottom {
+			m.selectedSessionMessage = max(0, len(m.sessionMessages)-1)
+			m.sessionLayout.messageScroll = max(0, len(m.sessionMessages)-m.sessionLayout.messageHeight)
+		}
+		
 		return m, m.listenToSession() // Continue listening
 
 	case ErrorMsg:
@@ -1644,7 +1719,7 @@ func (m Model) updateSessionViewer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.sessionSocket = nil
 		}
 		m.attachedSession = nil
-		m.sessionMessages = []LoggedMessage{}
+		// Keep messages for potential reconnection - they'll be cleared if attaching to different session
 		m.state = StateSessionList
 		// Refresh session list when returning
 		registry := NewSessionRegistryWithPath(m.sessionsDir)
@@ -1654,22 +1729,70 @@ func (m Model) updateSessionViewer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "up", "k":
-		// Scroll up in messages
-		if m.sessionScroll > 0 {
-			m.sessionScroll--
+		// Move selection up
+		if m.selectedSessionMessage > 0 {
+			m.selectedSessionMessage--
+			// Auto-scroll to keep selection visible
+			if m.selectedSessionMessage < m.sessionLayout.messageScroll {
+				m.sessionLayout.messageScroll = m.selectedSessionMessage
+			}
 		}
 	case "down", "j":
-		// Scroll down in messages
-		maxScroll := max(0, len(m.sessionMessages)-20) // Visible area
-		if m.sessionScroll < maxScroll {
-			m.sessionScroll++
+		// Move selection down
+		if m.selectedSessionMessage < len(m.sessionMessages)-1 {
+			m.selectedSessionMessage++
+			// Auto-scroll to keep selection visible
+			if m.selectedSessionMessage >= m.sessionLayout.messageScroll+m.sessionLayout.messageHeight {
+				m.sessionLayout.messageScroll = m.selectedSessionMessage - m.sessionLayout.messageHeight + 1
+			}
+		}
+	case "ctrl+u":
+		// Page up
+		pageSize := max(1, m.sessionLayout.messageHeight/2)
+		m.selectedSessionMessage = max(0, m.selectedSessionMessage-pageSize)
+		m.sessionLayout.messageScroll = max(0, m.selectedSessionMessage-5)
+	case "ctrl+d":
+		// Page down
+		pageSize := max(1, m.sessionLayout.messageHeight/2)
+		m.selectedSessionMessage = min(len(m.sessionMessages)-1, m.selectedSessionMessage+pageSize)
+		if m.selectedSessionMessage >= m.sessionLayout.messageScroll+m.sessionLayout.messageHeight {
+			m.sessionLayout.messageScroll = m.selectedSessionMessage - m.sessionLayout.messageHeight + 1
 		}
 	case "g":
 		// Go to top
-		m.sessionScroll = 0
+		m.selectedSessionMessage = 0
+		m.sessionLayout.messageScroll = 0
+		m.sessionLayout.detailScroll = 0
 	case "G":
 		// Go to bottom (latest messages)
-		m.sessionScroll = max(0, len(m.sessionMessages)-20)
+		m.selectedSessionMessage = max(0, len(m.sessionMessages)-1)
+		m.sessionLayout.messageScroll = max(0, len(m.sessionMessages)-m.sessionLayout.messageHeight)
+	case "enter":
+		// Reset detail scroll to top when selecting a message
+		if len(m.sessionMessages) > 0 && m.selectedSessionMessage < len(m.sessionMessages) {
+			m.sessionLayout.detailScroll = 0
+		}
+	case "+":
+		// Increase message pane size
+		if m.sessionLayout.messageRatio < 0.8 {
+			m.sessionLayout.messageRatio += 0.1
+			m.calculateSessionLayout()
+		}
+	case "-":
+		// Decrease message pane size
+		if m.sessionLayout.messageRatio > 0.2 {
+			m.sessionLayout.messageRatio -= 0.1
+			m.calculateSessionLayout()
+		}
+	case "shift+up":
+		// Scroll detail pane up
+		if m.sessionLayout.detailScroll > 0 {
+			m.sessionLayout.detailScroll--
+		}
+	case "shift+down":
+		// Scroll detail pane down
+		// This will be calculated in the view based on content size
+		m.sessionLayout.detailScroll++
 	}
 	return m, nil
 }
@@ -1690,11 +1813,47 @@ func (m Model) listenToSession() tea.Cmd {
 		// Parse the received data as a logged message
 		var loggedMsg LoggedMessage
 		if err := json.Unmarshal(buf[:n], &loggedMsg); err != nil {
-			// If JSON parsing fails, create a raw message
-			loggedMsg = LoggedMessage{
-				Content:   buf[:n],
-				Timestamp: time.Now(),
-				Direction: DirectionInbound, // Messages from proxy are inbound to us
+			// If JSON parsing fails, try to parse as raw JSON and create a message
+			var jsonObj interface{}
+			if jsonErr := json.Unmarshal(buf[:n], &jsonObj); jsonErr == nil {
+				// Pretty-print the JSON content
+				if prettyBytes, prettyErr := json.MarshalIndent(jsonObj, "", "  "); prettyErr == nil {
+					loggedMsg = LoggedMessage{
+						Content:   buf[:n],
+						Timestamp: time.Now(),
+						Direction: DirectionInbound,
+						Pretty:    string(prettyBytes),
+					}
+				} else {
+					loggedMsg = LoggedMessage{
+						Content:   buf[:n],
+						Timestamp: time.Now(),
+						Direction: DirectionInbound,
+						Pretty:    string(buf[:n]),
+					}
+				}
+			} else {
+				// Not JSON, treat as raw message
+				loggedMsg = LoggedMessage{
+					Content:   buf[:n],
+					Timestamp: time.Now(),
+					Direction: DirectionInbound,
+					Pretty:    string(buf[:n]),
+				}
+			}
+		} else {
+			// Successfully parsed as LoggedMessage, ensure Pretty field is set
+			if loggedMsg.Pretty == "" {
+				var jsonObj interface{}
+				if jsonErr := json.Unmarshal(loggedMsg.Content, &jsonObj); jsonErr == nil {
+					if prettyBytes, prettyErr := json.MarshalIndent(jsonObj, "", "  "); prettyErr == nil {
+						loggedMsg.Pretty = string(prettyBytes)
+					} else {
+						loggedMsg.Pretty = string(loggedMsg.Content)
+					}
+				} else {
+					loggedMsg.Pretty = string(loggedMsg.Content)
+				}
 			}
 		}
 		
@@ -2348,33 +2507,55 @@ func (m Model) View() string {
 			return "No session attached"
 		}
 		
-		s := styles.title.Render(fmt.Sprintf("Session Viewer: %s", m.attachedSession.Name))
-		s += "\n" + styles.header.Render(fmt.Sprintf("Target: %s | PID: %d", m.attachedSession.TargetCmd, m.attachedSession.PID))
+		// Calculate layout for three panes
+		m.calculateSessionLayout()
 		
-		// Status indicator
+		// === TOP PANE: Session Info (Fixed Height) ===
+		s := styles.title.Render(fmt.Sprintf("Session Viewer: %s", m.attachedSession.Name))
+		
+		// Target command info
+		s += "\n" + styles.header.Render(fmt.Sprintf("Target: %s", m.attachedSession.TargetCmd))
+		
+		// Status and stats
 		registry := NewSessionRegistryWithPath(m.sessionsDir)
 		statusIcon := "●"
 		statusColor := "2" // Green
-		if !registry.isProcessAlive(m.attachedSession.PID) {
+		isAlive := registry.isProcessAlive(m.attachedSession.PID)
+		if !isAlive {
 			statusIcon = "○"
 			statusColor = "1" // Red
 		}
 		statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor))
-		s += "\n" + statusStyle.Render(fmt.Sprintf("%s Session Status: %s", statusIcon, 
-			map[bool]string{true: "Active", false: "Disconnected"}[registry.isProcessAlive(m.attachedSession.PID)]))
 		
-		s += "\n" + strings.Repeat("─", m.width)
+		statusLine := fmt.Sprintf("%s %s | PID: %d | Messages: %d", 
+			statusIcon,
+			map[bool]string{true: "Active", false: "Disconnected"}[isAlive],
+			m.attachedSession.PID,
+			len(m.sessionMessages))
+		s += "\n" + statusStyle.Render(statusLine)
 		
-		// Live messages
-		s += "\n" + styles.header.Render(fmt.Sprintf("Live Messages (%d total):", len(m.sessionMessages)))
+		// Fill remaining info height
+		currentLines := strings.Count(s, "\n") + 1
+		for currentLines < m.sessionLayout.infoHeight-1 {
+			s += "\n"
+			currentLines++
+		}
+		
+		s += "\n" + strings.Repeat("─", m.width) // Separator
+		
+		// === MIDDLE PANE: Message List (Scrollable) ===
+		s += "\n" + styles.header.Render(fmt.Sprintf("Messages (%d total):", len(m.sessionMessages)))
 		
 		if len(m.sessionMessages) == 0 {
 			s += "\n" + styles.normal.Render("No messages yet... waiting for MCP communication")
+			// Fill remaining message pane space
+			for i := 0; i < m.sessionLayout.messageHeight-2; i++ {
+				s += "\n"
+			}
 		} else {
-			// Show scrollable messages
-			visibleLines := m.height - 8 // Reserve space for header and controls
-			startIdx := m.sessionScroll
-			endIdx := min(startIdx+visibleLines, len(m.sessionMessages))
+			// Calculate visible message range
+			startIdx := m.sessionLayout.messageScroll
+			endIdx := min(startIdx+m.sessionLayout.messageHeight-1, len(m.sessionMessages))
 			
 			for i := startIdx; i < endIdx; i++ {
 				msg := m.sessionMessages[i]
@@ -2390,21 +2571,36 @@ func (m Model) View() string {
 				timestamp := msg.Timestamp.Format("15:04:05.000")
 				msgStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
 				
-				// Show message content (truncated for display)
-				content := string(msg.Content)
-				if len(content) > 100 {
-					content = content[:97] + "..."
+				// Highlight selected message
+				if i == m.selectedSessionMessage {
+					msgStyle = styles.selected
 				}
 				
-				s += "\n" + msgStyle.Render(fmt.Sprintf("%s %s %s", direction, timestamp, content))
+				// Show message content (truncated for middle pane)
+				content := string(msg.Content)
+				maxLen := m.width - 20 // Reserve space for timestamp and direction
+				if len(content) > maxLen {
+					content = content[:maxLen-3] + "..."
+				}
+				
+				messageLine := fmt.Sprintf("%s %s %s", direction, timestamp, content)
+				s += "\n" + msgStyle.Render(messageLine)
+			}
+			
+			// Fill remaining message pane space
+			currentMsgLines := endIdx - startIdx
+			for currentMsgLines < m.sessionLayout.messageHeight-1 {
+				s += "\n"
+				currentMsgLines++
 			}
 			
 			// Show scroll indicators
 			if startIdx > 0 || endIdx < len(m.sessionMessages) {
-				scrollInfo := fmt.Sprintf("[%d-%d/%d]", startIdx+1, endIdx, len(m.sessionMessages))
+				scrollInfo := ""
 				if startIdx > 0 {
-					scrollInfo = "↑ " + scrollInfo
+					scrollInfo += "↑ "
 				}
+				scrollInfo += fmt.Sprintf("[%d-%d/%d]", startIdx+1, endIdx, len(m.sessionMessages))
 				if endIdx < len(m.sessionMessages) {
 					scrollInfo += " ↓"
 				}
@@ -2412,7 +2608,63 @@ func (m Model) View() string {
 			}
 		}
 		
-		s += "\n\n" + "↑/↓ scroll messages, G top, Shift+G bottom, Esc detach, Q quit"
+		s += strings.Repeat("─", m.width) // Separator
+		
+		// === BOTTOM PANE: Message Detail (Scrollable) ===
+		s += "\n" + styles.header.Render("Message Detail:")
+		
+		if len(m.sessionMessages) == 0 || m.selectedSessionMessage >= len(m.sessionMessages) {
+			s += "\n" + styles.normal.Render("No message selected")
+		} else {
+			selectedMsg := m.sessionMessages[m.selectedSessionMessage]
+			
+			// Message metadata
+			direction := map[MessageDirection]string{DirectionInbound: "Inbound", DirectionOutbound: "Outbound"}[selectedMsg.Direction]
+			metadata := fmt.Sprintf("Direction: %s | Time: %s", direction, selectedMsg.Timestamp.Format("15:04:05.000"))
+			s += "\n" + styles.normal.Copy().Faint(true).Render(metadata)
+			s += "\n" // Separator
+			
+			// Show scrollable detail content
+			if selectedMsg.Pretty != "" {
+				detailLines := strings.Split(selectedMsg.Pretty, "\n")
+				startIdx := m.sessionLayout.detailScroll
+				endIdx := min(startIdx+m.sessionLayout.detailHeight-4, len(detailLines)) // Reserve space for metadata
+				
+				for i := startIdx; i < endIdx; i++ {
+					line := detailLines[i]
+					// Apply syntax highlighting for JSON
+					if strings.TrimSpace(line) != "" {
+						if strings.Contains(line, ":") && (strings.Contains(line, "{") || strings.Contains(line, "}")) {
+							s += "\n" + styles.normal.Copy().Foreground(lipgloss.Color("6")).Render(line)
+						} else if strings.HasPrefix(strings.TrimSpace(line), "\"") {
+							s += "\n" + styles.normal.Copy().Foreground(lipgloss.Color("2")).Render(line)
+						} else {
+							s += "\n" + styles.normal.Render(line)
+						}
+					} else {
+						s += "\n"
+					}
+				}
+				
+				// Show scroll indicators for detail
+				if startIdx > 0 || endIdx < len(detailLines) {
+					scrollInfo := ""
+					if startIdx > 0 {
+						scrollInfo += "↑ "
+					}
+					scrollInfo += fmt.Sprintf("[%d-%d/%d]", startIdx+1, min(endIdx, len(detailLines)), len(detailLines))
+					if endIdx < len(detailLines) {
+						scrollInfo += " ↓"
+					}
+					s += "\n" + styles.normal.Copy().Faint(true).Render(scrollInfo)
+				}
+			} else {
+				s += "\n" + styles.normal.Render(string(selectedMsg.Content))
+			}
+		}
+		
+		// Instructions at the bottom
+		s += "\n\n" + "↑/↓ select, Shift+↑↓ scroll detail, +/- resize panes, G top, Shift+G bottom, Ctrl+U/D page, Esc detach, Q quit"
 		
 		if m.error != "" {
 			s += "\n" + styles.error.Render("Error: "+m.error)
