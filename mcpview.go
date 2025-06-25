@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -607,11 +608,18 @@ func NewStdioProxyWithSession(targetCmd, sessionName string) *StdioProxy {
 
 // NewStdioProxyWithSessionAndDir creates a new stdio proxy with session support and custom directory
 func NewStdioProxyWithSessionAndDir(targetCmd, sessionName, sessionsDir string) *StdioProxy {
+	var socketPath string
+	if sessionName != "" {
+		socketPath = fmt.Sprintf("%s/%s/socket", sessionsDir, sessionName)
+	}
+	
 	return &StdioProxy{
-		targetCmd:   targetCmd,
-		messageLog:  make([]LoggedMessage, 0),
-		sessionName: sessionName,
-		sessionsDir: sessionsDir,
+		targetCmd:     targetCmd,
+		messageLog:    make([]LoggedMessage, 0),
+		sessionName:   sessionName,
+		sessionsDir:   sessionsDir,
+		socketPath:    socketPath,
+		socketClients: make([]net.Conn, 0),
 	}
 }
 
@@ -637,6 +645,9 @@ func (sp *StdioProxy) logMessage(direction MessageDirection, content []byte) {
 	sp.mutex.Lock()
 	sp.messageLog = append(sp.messageLog, msg)
 	sp.mutex.Unlock()
+	
+	// Broadcast to socket clients for real-time streaming
+	sp.broadcastToSocketClients(msg)
 	
 	// Call callback if set
 	if sp.logCallback != nil {
@@ -673,13 +684,19 @@ func (sp *StdioProxy) Start() error {
 	
 	sp.running = true
 	
-	// Create session metadata if session name is provided
+	// Create session metadata if session name is provided (this creates the directory)
 	if sp.sessionName != "" {
 		registry := NewSessionRegistryWithPath(sp.sessionsDir)
 		if err := registry.createSession(sp.sessionName, sp.targetCmd, sp.targetProc.Process.Pid); err != nil {
 			// Log error but don't fail the proxy - session is optional
 			fmt.Fprintf(os.Stderr, "Warning: Failed to create session metadata: %v\n", err)
 		}
+	}
+	
+	// Start socket server for message streaming (after session directory exists)
+	if err := sp.startSocketServer(); err != nil {
+		// Log error but don't fail the proxy - socket is optional
+		fmt.Fprintf(os.Stderr, "Warning: Failed to start socket server: %v\n", err)
 	}
 	
 	// Start background goroutine to read from target server
@@ -729,6 +746,24 @@ func (sp *StdioProxy) readFromTarget() {
 
 func (sp *StdioProxy) Stop() error {
 	sp.running = false
+	
+	// Close socket connections and listener
+	if sp.socketListener != nil {
+		sp.socketListener.Close()
+	}
+	
+	sp.mutex.Lock()
+	for _, client := range sp.socketClients {
+		client.Close()
+	}
+	sp.socketClients = sp.socketClients[:0]
+	sp.mutex.Unlock()
+	
+	// Remove socket file
+	if sp.socketPath != "" {
+		os.Remove(sp.socketPath)
+	}
+	
 	if sp.targetStdin != nil {
 		sp.targetStdin.Close()
 	}
@@ -755,6 +790,107 @@ func (sp *StdioProxy) GetMessageLog() []LoggedMessage {
 	sp.mutex.RLock()
 	defer sp.mutex.RUnlock()
 	return sp.messageLog
+}
+
+// startSocketServer creates and starts the Unix socket server for message streaming
+func (sp *StdioProxy) startSocketServer() error {
+	if sp.socketPath == "" {
+		// No socket needed for sessions without names
+		return nil
+	}
+
+	// Remove existing socket file if it exists
+	os.Remove(sp.socketPath)
+
+	listener, err := net.Listen("unix", sp.socketPath)
+	if err != nil {
+		return fmt.Errorf("failed to create Unix socket: %v", err)
+	}
+
+	sp.socketListener = listener
+
+	// Start accepting connections in a goroutine
+	go sp.acceptSocketConnections()
+
+	return nil
+}
+
+// acceptSocketConnections handles incoming socket connections
+func (sp *StdioProxy) acceptSocketConnections() {
+	for sp.running {
+		conn, err := sp.socketListener.Accept()
+		if err != nil {
+			if sp.running {
+				fmt.Fprintf(os.Stderr, "Error accepting socket connection: %v\n", err)
+			}
+			break
+		}
+
+		sp.mutex.Lock()
+		sp.socketClients = append(sp.socketClients, conn)
+		sp.mutex.Unlock()
+
+		// Handle client connection in separate goroutine
+		go sp.handleSocketClient(conn)
+	}
+}
+
+// handleSocketClient manages a single socket client connection
+func (sp *StdioProxy) handleSocketClient(conn net.Conn) {
+	defer func() {
+		conn.Close()
+		// Remove from clients list
+		sp.mutex.Lock()
+		for i, client := range sp.socketClients {
+			if client == conn {
+				sp.socketClients = append(sp.socketClients[:i], sp.socketClients[i+1:]...)
+				break
+			}
+		}
+		sp.mutex.Unlock()
+	}()
+
+	// Send existing message history to new client
+	sp.mutex.RLock()
+	history := make([]LoggedMessage, len(sp.messageLog))
+	copy(history, sp.messageLog)
+	sp.mutex.RUnlock()
+
+	for _, msg := range history {
+		sp.sendMessageToClient(conn, msg)
+	}
+
+	// Keep connection alive (client will close when done)
+	buf := make([]byte, 1)
+	for {
+		_, err := conn.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+}
+
+// sendMessageToClient sends a logged message to a socket client
+func (sp *StdioProxy) sendMessageToClient(conn net.Conn, msg LoggedMessage) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	
+	// Send with newline delimiter
+	conn.Write(append(data, '\n'))
+}
+
+// broadcastToSocketClients sends a message to all connected socket clients
+func (sp *StdioProxy) broadcastToSocketClients(msg LoggedMessage) {
+	sp.mutex.RLock()
+	clients := make([]net.Conn, len(sp.socketClients))
+	copy(clients, sp.socketClients)
+	sp.mutex.RUnlock()
+
+	for _, client := range clients {
+		sp.sendMessageToClient(client, msg)
+	}
 }
 
 // Session registry functions
@@ -925,17 +1061,20 @@ type ToolLayout struct {
 
 // Stdio Proxy manages MCP stdio proxy functionality
 type StdioProxy struct {
-	targetCmd    string
-	targetProc   *exec.Cmd
-	targetStdin  io.WriteCloser
-	targetStdout io.ReadCloser
-	targetReader *bufio.Scanner
-	messageLog   []LoggedMessage
-	logCallback  func(LoggedMessage)
-	mutex        sync.RWMutex
-	running      bool
-	sessionName  string // Session name for proxy sessions
-	sessionsDir  string // Directory for session metadata
+	targetCmd      string
+	targetProc     *exec.Cmd
+	targetStdin    io.WriteCloser
+	targetStdout   io.ReadCloser
+	targetReader   *bufio.Scanner
+	messageLog     []LoggedMessage
+	logCallback    func(LoggedMessage)
+	mutex          sync.RWMutex
+	running        bool
+	sessionName    string // Session name for proxy sessions
+	sessionsDir    string // Directory for session metadata
+	socketListener net.Listener // Unix socket listener for message streaming
+	socketPath     string // Path to the Unix socket
+	socketClients  []net.Conn // Connected socket clients
 }
 
 // Session management structures
