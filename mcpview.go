@@ -594,6 +594,15 @@ func NewStdioProxy(targetCmd string) *StdioProxy {
 	}
 }
 
+// NewStdioProxyWithSession creates a new stdio proxy with session support
+func NewStdioProxyWithSession(targetCmd, sessionName string) *StdioProxy {
+	return &StdioProxy{
+		targetCmd:   targetCmd,
+		messageLog:  make([]LoggedMessage, 0),
+		sessionName: sessionName,
+	}
+}
+
 func (sp *StdioProxy) SetLogCallback(callback func(LoggedMessage)) {
 	sp.logCallback = callback
 }
@@ -651,6 +660,15 @@ func (sp *StdioProxy) Start() error {
 	}
 	
 	sp.running = true
+	
+	// Create session metadata if session name is provided
+	if sp.sessionName != "" {
+		registry := NewSessionRegistry()
+		if err := registry.createSession(sp.sessionName, sp.targetCmd, sp.targetProc.Process.Pid); err != nil {
+			// Log error but don't fail the proxy - session is optional
+			fmt.Fprintf(os.Stderr, "Warning: Failed to create session metadata: %v\n", err)
+		}
+	}
 	
 	// Start background goroutine to read from target server
 	go sp.readFromTarget()
@@ -717,6 +735,54 @@ func (sp *StdioProxy) GetMessageLog() []LoggedMessage {
 	return sp.messageLog
 }
 
+// Session registry functions
+func NewSessionRegistry() *SessionRegistry {
+	return &SessionRegistry{
+		basePath: "/tmp/mcpview-sessions",
+	}
+}
+
+func (sr *SessionRegistry) createSessionDir(name string) error {
+	sessionDir := sr.getSessionDir(name)
+	return os.MkdirAll(sessionDir, 0755)
+}
+
+func (sr *SessionRegistry) getSessionDir(name string) string {
+	return fmt.Sprintf("%s/%s", sr.basePath, name)
+}
+
+func (sr *SessionRegistry) getMetadataPath(name string) string {
+	return fmt.Sprintf("%s/metadata.json", sr.getSessionDir(name))
+}
+
+func (sr *SessionRegistry) createSession(name, targetCmd string, pid int) error {
+	if err := sr.createSessionDir(name); err != nil {
+		return fmt.Errorf("failed to create session directory: %v", err)
+	}
+
+	session := ProxySession{
+		Name:         name,
+		TargetCmd:    targetCmd,
+		PID:          pid,
+		StartTime:    time.Now(),
+		SocketPath:   fmt.Sprintf("%s/socket", sr.getSessionDir(name)),
+		MessageCount: 0,
+		LastActivity: time.Now(),
+	}
+
+	data, err := json.MarshalIndent(session, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal session metadata: %v", err)
+	}
+
+	metadataPath := sr.getMetadataPath(name)
+	if err := os.WriteFile(metadataPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write session metadata: %v", err)
+	}
+
+	return nil
+}
+
 // Debug mode layout
 type DebugLayout struct {
 	messagePaneHeight int
@@ -747,6 +813,22 @@ type StdioProxy struct {
 	logCallback  func(LoggedMessage)
 	mutex        sync.RWMutex
 	running      bool
+	sessionName  string // Session name for proxy sessions
+}
+
+// Session management structures
+type ProxySession struct {
+	Name         string    `json:"name"`
+	TargetCmd    string    `json:"targetCmd"`
+	PID          int       `json:"pid"`
+	StartTime    time.Time `json:"startTime"`
+	SocketPath   string    `json:"socketPath"`
+	MessageCount int       `json:"messageCount"`
+	LastActivity time.Time `json:"lastActivity"`
+}
+
+type SessionRegistry struct {
+	basePath string // /tmp/mcpview-sessions/
 }
 
 // Bubbletea Model
@@ -1786,6 +1868,7 @@ func main() {
 	serverCmd := flag.String("server", "", "MCP server command to connect to automatically")
 	proxyMode := flag.Bool("proxy", false, "Start in stdio proxy mode")
 	targetCmd := flag.String("target", "", "Target MCP server command for proxy mode")
+	sessionName := flag.String("session", "", "Session name for proxy mode")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "MCP Explorer - A comprehensive terminal UI for debugging and developing with MCP servers\n\n")
@@ -1797,6 +1880,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s --server \"python srv.py\"  # Auto-connect to server\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --debug --server \"node server.js\" # Debug mode with auto-connect\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --proxy --target \"python srv.py\" # Stdio proxy mode\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --proxy --target \"python srv.py\" --session \"myapi\" # Named proxy session\n", os.Args[0])
 	}
 	flag.Parse()
 	
@@ -1813,7 +1897,12 @@ func main() {
 	
 	// Handle stdio proxy mode - this runs without TUI
 	if *proxyMode {
-		proxy := NewStdioProxy(*targetCmd)
+		var proxy *StdioProxy
+		if *sessionName != "" {
+			proxy = NewStdioProxyWithSession(*targetCmd, *sessionName)
+		} else {
+			proxy = NewStdioProxy(*targetCmd)
+		}
 		if err := proxy.RunProxy(); err != nil {
 			log.Fatalf("Stdio proxy error: %v", err)
 		}

@@ -50,7 +50,7 @@ mcpview --proxy --target "python server.py"
 mcpview
 ```
 
-**Key Controls:** `↑↓/jk` navigate • `Enter` select • `T` test tool • `M` messages • `D` debug • `Q` quit
+**Key Controls:** `↑↓/jk` navigate • `Enter` select • `t` test tool • `r` resources • `m` messages • `d` debug • `q` quit
 
 ## What is MCP?
 
@@ -58,4 +58,4 @@ mcpview
 
 ## License
 
-MIT License - see LICENSE file for details.
+Apache License 2.0 - see [LICENSE](LICENSE) for details.
