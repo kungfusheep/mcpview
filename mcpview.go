@@ -1126,6 +1126,14 @@ func (sr *SessionRegistry) loadMessagesFromSession(sessionName string) ([]Logged
 			continue
 		}
 
+		// Regenerate Pretty field for loaded messages since it's not persisted
+		var prettyBuf bytes.Buffer
+		if err := json.Indent(&prettyBuf, msg.Content, "", "  "); err == nil {
+			msg.Pretty = prettyBuf.String()
+		} else {
+			msg.Pretty = string(msg.Content)
+		}
+
 		messages = append(messages, msg)
 	}
 
