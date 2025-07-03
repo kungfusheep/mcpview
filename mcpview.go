@@ -133,7 +133,7 @@ func generateRandomSessionName() string {
 // JSON-RPC 2.0 message types
 type JSONRPCRequest struct {
 	JSONRPC string      `json:"jsonrpc"`
-	ID      interface{} `json:"id"`
+	ID      interface{} `json:"id,omitempty"`
 	Method  string      `json:"method"`
 	Params  interface{} `json:"params,omitempty"`
 }
